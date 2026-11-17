@@ -15,9 +15,10 @@ from __future__ import annotations
 import logging
 import random
 import time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from .driver import Driver
+if TYPE_CHECKING:  # 纯逻辑模块不应硬依赖 selenium，便于离线单测
+    from .driver import Driver
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ class Api:
 
     def __init__(
         self,
-        driver: Driver,
+        driver: "Driver",
         delay_min: int = 2,
         delay_max: int = 5,
         captcha_check: bool = True,
