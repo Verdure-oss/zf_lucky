@@ -383,6 +383,23 @@ class Database:
             row = cur.fetchone()
             return int(row["retry_cnt"]) if row else 0
 
+    def mark_failed_no_retry(self, hash_: str, fail_reason: Optional[str]) -> None:
+        """
+        记录失败但**不**消耗重试次数。
+
+        用于限流、验证码、登录失效这类「不是帖子本身的问题」：
+        它们重试也不会好，消耗次数只会让帖子提前 give_up。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE participations
+                SET state = 'failed', fail_reason = ?, updated_at = ?
+                WHERE hash = ?
+                """,
+                (fail_reason, now_str(), hash_),
+            )
+
     def reset_participation(self, hash_: str) -> None:
         """强制重跑：清空参与进度，回到 pending。"""
         with self._cursor() as cur:
