@@ -20,22 +20,56 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+# selenium 只在真正驱动浏览器时才需要。
+# 采用软导入，使「纯逻辑模块」（调度、DB、语料、面板）在没有 selenium
+# 的环境里也能 import 与单测——否则每加一个新模块都要重复踩这个坑。
+try:
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        TimeoutException,
+        WebDriverException,
+    )
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    SELENIUM_AVAILABLE = True
+    SELENIUM_IMPORT_ERROR: Optional[str] = None
+except ImportError as exc:  # pragma: no cover - 仅无依赖环境触发
+    webdriver = None  # type: ignore[assignment]
+    SELENIUM_AVAILABLE = False
+    SELENIUM_IMPORT_ERROR = str(exc)
+
+    class WebDriverException(Exception):  # type: ignore[no-redef]
+        """占位：无 selenium 时用于类型与 except 语句。"""
+
+    class NoSuchElementException(Exception):  # type: ignore[no-redef]
+        """占位。"""
+
+    class TimeoutException(Exception):  # type: ignore[no-redef]
+        """占位。"""
+
+    Options = None  # type: ignore[assignment]
+    By = None  # type: ignore[assignment]
+    EC = None  # type: ignore[assignment]
+    WebDriverWait = None  # type: ignore[assignment]
 
 log = logging.getLogger(__name__)
 
 
 class DriverError(RuntimeError):
     """WebDriver 层的错误基类。"""
+
+
+def require_selenium() -> None:
+    """在真正需要驱动浏览器前调用，给出明确的安装提示。"""
+    if not SELENIUM_AVAILABLE:
+        raise DriverError(
+            "缺少 selenium 依赖"
+            f"（{SELENIUM_IMPORT_ERROR}）。请执行 pip install -r requirements.txt"
+        )
 
 
 class SeleniumUnavailable(DriverError):
@@ -82,6 +116,7 @@ class Driver:
 
     def start(self, session_timeout: int = 1800) -> None:
         """创建浏览器会话。"""
+        require_selenium()
         options = Options()
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
