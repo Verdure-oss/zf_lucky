@@ -1,0 +1,36 @@
+# ===== 环境与密钥（务必不要提交）=====
+.env
+.env.local
+*.pem
+*.key
+*cookie*
+
+# ===== 数据与运行时产物 =====
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite3
+*.log
+
+# ===== Python =====
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+pyvenv
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ===== 本地基准文件（实测抓取的一手样本，含真实标题/作者，仅本地参考）=====
+docs/reference/
