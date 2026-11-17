@@ -27,6 +27,9 @@ services:
     ports:
       # 只绑回环。9997 空闲（9998=bili-panel，9999=bili-logs 已占用）
       - "127.0.0.1:9997:8080"
+      # noVNC 网关。默认不监听（进程未启动时端口不接受连接），
+      # 由面板开关控制启停；nginx 始终指向这里。
+      - "127.0.0.1:7910:7910"
     networks:
       - bili-net
     healthcheck:

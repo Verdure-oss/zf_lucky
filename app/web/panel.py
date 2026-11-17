@@ -23,15 +23,21 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, jsonify, render_template_string, request
 
 from ..db import Database
+from . import envfile
+from .login_session import LoginSession
 
 log = logging.getLogger(__name__)
 
 TRIGGER_FILE = "/tmp/zf_lucky_trigger"
 PAUSE_FILE = "/tmp/zf_lucky_paused"
+VNC_FLAG_FILE = "/tmp/zf_vnc_enabled"
+VNC_GATE_SCRIPT = "/app/scripts/vnc_gate.py"
+ENV_PATH = "/app/.env"
 
 app = Flask(__name__)
 _db: Optional[Database] = None
 _cfg = None
+_login: Optional[LoginSession] = None
 
 
 def init(db_path: str, cfg=None) -> None:
@@ -40,6 +46,68 @@ def init(db_path: str, cfg=None) -> None:
     _db = Database(db_path)
     _db.connect()
     _cfg = cfg
+
+
+def get_login_session() -> LoginSession:
+    """懒加载登录会话（它依赖 selenium，只在用到时才创建）。"""
+    global _login
+    if _login is None:
+        url = getattr(_cfg, "selenium_url", "http://bili-selenium:4444")
+        _login = LoginSession(url)
+    return _login
+
+
+# ---------------- VNC 网关 ----------------
+
+def vnc_status() -> Dict[str, Any]:
+    """
+    查询网关状态。
+
+    用子进程执行 vnc_gate.py status，避免把端口探测逻辑写两份。
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [__import__("sys").executable, VNC_GATE_SCRIPT, "status"],
+            capture_output=True, text=True, timeout=10,
+        )
+        running = proc.returncode == 0
+        return {"running": running, "detail": proc.stdout.strip()}
+    except Exception as exc:
+        return {"running": False, "detail": f"检测失败：{exc}"}
+
+
+def vnc_toggle(enable: bool) -> Dict[str, Any]:
+    """开关网关。关闭时会立即断开所有已建立的连接。"""
+    import subprocess
+
+    action = "start" if enable else "stop"
+    try:
+        proc = subprocess.run(
+            [__import__("sys").executable, VNC_GATE_SCRIPT, action],
+            capture_output=True, text=True, timeout=20,
+        )
+        ok = proc.returncode == 0
+
+        # 记录开关状态，供容器重启后恢复
+        if ok:
+            try:
+                if enable:
+                    with open(VNC_FLAG_FILE, "w") as fh:
+                        fh.write("1")
+                elif os.path.exists(VNC_FLAG_FILE):
+                    os.unlink(VNC_FLAG_FILE)
+            except OSError as exc:
+                log.warning("记录 VNC 开关状态失败：%s", exc)
+
+        return {
+            "ok": ok,
+            "running": enable and ok,
+            "msg": (proc.stdout or proc.stderr).strip() or ("已开启" if enable else "已关闭"),
+        }
+    except Exception as exc:
+        return {"ok": False, "running": False, "msg": str(exc)}
 
 
 def _get_db() -> Database:
@@ -166,7 +234,20 @@ def build_view() -> Dict[str, Any]:
         "paused": os.path.exists(PAUSE_FILE),
         "run_at": getattr(_cfg, "run_at", "09:00") if _cfg else "09:00",
         "cookie_ok": bool(getattr(_cfg, "cookie", "")) if _cfg else False,
+        "cookie_desc": envfile.mask(getattr(_cfg, "cookie", "") or "") if _cfg else "",
+        "vnc": vnc_status(),
+        "login": _login_safe_status(),
     }
+
+
+def _login_safe_status() -> Dict[str, Any]:
+    """登录会话状态；从未创建过时返回未运行，避免无谓地拉起 selenium。"""
+    if _login is None:
+        return {"running": False, "check": {"logged_in": False, "msg": "未启动"}}
+    try:
+        return _login.status()
+    except Exception as exc:
+        return {"running": False, "check": {"logged_in": False, "msg": str(exc)}}
 
 
 # ---------------- 路由 ----------------
@@ -216,6 +297,123 @@ def api_pause():
     except OSError as exc:
         return jsonify({"ok": False, "msg": str(exc)}), 500
     return jsonify({"ok": True, "paused": enable})
+
+
+# ---------------- VNC 与登录 ----------------
+
+@app.route("/api/vnc", methods=["GET", "POST"])
+def api_vnc():
+    """查询或切换 noVNC 公网入口。"""
+    if request.method == "GET":
+        return jsonify(vnc_status())
+    enable = bool((request.get_json(silent=True) or {}).get("enable", True))
+    result = vnc_toggle(enable)
+    # 关闭网关时顺带关掉登录会话，避免留下一个看不见却开着的浏览器
+    if not enable:
+        try:
+            get_login_session().stop()
+        except Exception:
+            pass
+    return jsonify(result)
+
+
+@app.route("/api/login/start", methods=["POST"])
+def api_login_start():
+    """启动登录会话并自动开启 VNC 网关。"""
+    try:
+        res = get_login_session().start()
+        vnc_on = False
+        if res.get("ok"):
+            # 没开网关的话，用户看不到浏览器，登录流程无法进行
+            v = vnc_toggle(True)
+            vnc_on = bool(v.get("running") or v.get("ok"))
+        res["vnc"] = vnc_on
+        return jsonify(res)
+    except Exception as exc:
+        log.exception("启动登录会话失败")
+        return jsonify({"ok": False, "msg": str(exc)}), 500
+
+
+@app.route("/api/login/status")
+def api_login_status():
+    sess = get_login_session()
+    st = sess.status()
+    if st["running"]:
+        try:
+            st["check"] = sess.check_logged_in()
+        except Exception as exc:
+            st["check"] = {"logged_in": False, "msg": str(exc)}
+    else:
+        st["check"] = {"logged_in": False, "msg": "登录会话未运行"}
+    return jsonify(st)
+
+
+@app.route("/api/login/finish", methods=["POST"])
+def api_login_finish():
+    """
+    用户确认已登录 → 导出 cookie → 写入 .env → 关闭会话与网关。
+
+    写入后需要重启容器，新 Cookie 才会被主流程读到。
+    """
+    sess = get_login_session()
+    try:
+        check = sess.check_logged_in()
+        if not check.get("logged_in"):
+            return jsonify({
+                "ok": False,
+                "msg": "尚未检测到登录状态。请确认已在浏览器中完成登录。",
+            }), 409
+
+        cookie_str = sess.export_cookie_string()
+        ok, detail = envfile.update_env_var(ENV_PATH, "ZF_COOKIE", cookie_str)
+        if not ok:
+            return jsonify({"ok": False, "msg": f"写入 .env 失败：{detail}"}), 500
+
+        # 收尾：会话与网关都关掉，减少暴露面
+        sess.stop()
+        vnc_toggle(False)
+
+        return jsonify({
+            "ok": True,
+            "msg": f"已保存 Cookie（{envfile.mask(cookie_str)}）。"
+                   "重启容器后生效。",
+            "need_restart": True,
+            "cookie": envfile.mask(cookie_str),
+            "user": check.get("nickname") or check.get("uid"),
+        })
+    except Exception as exc:
+        log.exception("导出 Cookie 失败")
+        return jsonify({"ok": False, "msg": str(exc)}), 500
+
+
+@app.route("/api/login/cancel", methods=["POST"])
+def api_login_cancel():
+    """放弃登录：关闭会话与网关，不动 .env。"""
+    try:
+        get_login_session().stop()
+        vnc_toggle(False)
+        return jsonify({"ok": True, "msg": "已取消"})
+    except Exception as exc:
+        return jsonify({"ok": False, "msg": str(exc)}), 500
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """
+    请求重启容器。
+
+    容器内无法重启自身，因此写一个标记文件，
+    由宿主机侧（运维命令或 systemd timer）消费，或用户手动执行。
+    """
+    try:
+        with open("/tmp/zf_restart_requested", "w") as fh:
+            fh.write(datetime.now().isoformat())
+    except OSError as exc:
+        return jsonify({"ok": False, "msg": str(exc)}), 500
+    return jsonify({
+        "ok": True,
+        "msg": "已请求重启。请在宿主机执行：cd /root/zf_lucky && docker compose restart",
+    })
 
 
 @app.route("/api/reset/<hash_>", methods=["POST"])
@@ -372,6 +570,52 @@ PAGE = r"""
   </div>
   {% endif %}
 
+  <!-- 登录与浏览器观看 -->
+  <div class="bar" style="margin-top:0">
+    <div class="stat" style="min-width:110px">
+      <b style="font-size:12px">
+        {% if v['login'].running %}
+          <span style="color:var(--ok)">登录中</span>
+        {% else %}
+          <span style="color:var(--muted)">未启动</span>
+        {% endif %}
+      </b>
+      <span>登录会话</span>
+    </div>
+    <div class="stat" style="min-width:110px">
+      <b style="font-size:12px">
+        {% if v['vnc'].running %}
+          <span style="color:var(--ok)">已开启</span>
+        {% else %}
+          <span style="color:var(--muted)">已关闭</span>
+        {% endif %}
+      </b>
+      <span>浏览器观看</span>
+    </div>
+    <div class="grow"></div>
+    {% if v['login'].running %}
+      <a href="/vnc/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noopener"
+         style="text-decoration:none"><button class="primary">打开浏览器画面</button></a>
+      <button onclick="loginFinish()">我登录好了</button>
+      <button onclick="loginCancel()">取消</button>
+    {% else %}
+      <button onclick="loginStart()">登录并获取 Cookie</button>
+      {% if v['vnc'].running %}
+      <button onclick="vncToggle(false)">关闭观看</button>
+      {% endif %}
+    {% endif %}
+  </div>
+
+  {% if v['login'].running %}
+  <div class="alert" style="margin-bottom:14px">
+    浏览器已打开登录页。请点上方「打开浏览器画面」，在弹出的窗口里扫码或输入账号密码完成登录，
+    成功后点「我登录好了」——程序会把 Cookie 写入配置并提示重启。
+    {% if v['login'].check and v['login'].check.logged_in %}
+    <br><b style="color:var(--ok)">已检测到登录：{{ v['login'].check.nickname }}</b>
+    {% endif %}
+  </div>
+  {% endif %}
+
   {% if v['last'] %}
   <div class="sub" style="margin-bottom:12px">
     上次运行：
@@ -483,6 +727,57 @@ function doReset(h){
     if (d.ok) setTimeout(function(){ location.reload(); }, 1200);
   }).catch(function(e){ toast('请求失败：' + e); });
 }
+
+function vncToggle(enable){
+  post('/api/vnc', {enable: enable}).then(function(d){
+    toast(d.msg || (enable ? '已开启' : '已关闭'));
+    setTimeout(function(){ location.reload(); }, 900);
+  }).catch(function(e){ toast('请求失败：' + e); });
+}
+
+function loginStart(){
+  toast('正在启动浏览器…');
+  post('/api/login/start', {}).then(function(d){
+    toast(d.msg || (d.ok ? '已启动' : '失败'));
+    if (d.ok) setTimeout(function(){
+      window.open('/vnc/vnc.html?autoconnect=1&resize=scale', '_blank');
+      location.reload();
+    }, 3500);
+  }).catch(function(e){ toast('请求失败：' + e); });
+}
+
+function loginFinish(){
+  toast('正在导出 Cookie…');
+  post('/api/login/finish', {}).then(function(d){
+    if (d.ok){
+      toast(d.msg);
+      setTimeout(function(){ location.reload(); }, 2200);
+    } else {
+      toast(d.msg || '失败');
+    }
+  }).catch(function(e){ toast('请求失败：' + e); });
+}
+
+function loginCancel(){
+  post('/api/login/cancel', {}).then(function(d){
+    toast(d.msg || '已取消');
+    setTimeout(function(){ location.reload(); }, 800);
+  }).catch(function(e){ toast('请求失败：' + e); });
+}
+
+// 登录会话运行中时，每 4 秒自动检测一次是否已登录
+{% if v['login'].running %}
+setInterval(function(){
+  fetch('/api/login/status').then(function(r){ return r.json(); }).then(function(d){
+    if (d.check && d.check.logged_in){
+      var t = document.getElementById('toast');
+      if (t && !t.classList.contains('show')){
+        toast('已检测到登录，可以点「我登录好了」');
+      }
+    }
+  }).catch(function(){});
+}, 4000);
+{% endif %}
 </script>
 </body>
 </html>
