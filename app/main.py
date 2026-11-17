@@ -95,6 +95,31 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _start_panel(cfg) -> None:
+    """
+    在后台线程启动 Web 面板。
+
+    面板与主流程共用同一个 SQLite（WAL 模式支持并发读）。
+    面板起失败不阻塞主流程——它只是观察窗，不是必需组件。
+    """
+    try:
+        from threading import Thread
+
+        from .web import panel
+
+        panel.init(cfg.db_path, cfg)
+        thread = Thread(
+            target=panel.run_server,
+            args=(cfg.panel_port,),
+            daemon=True,
+            name="panel",
+        )
+        thread.start()
+        log.info("面板已启动：http://0.0.0.0:%d", cfg.panel_port)
+    except Exception:
+        log.exception("面板启动失败（不影响主流程）")
+
+
 def next_run_at(target: str, now: Optional[datetime] = None) -> datetime:
     """
     下一个 HH:MM 的**精确**时间点。
@@ -156,6 +181,10 @@ def main() -> int:
 
     db = Database(cfg.db_path)
     db.connect()
+
+    # 面板作为后台线程启动：即使配置有问题也要能打开，
+    # 否则用户看不到具体错误原因。
+    _start_panel(cfg)
 
     stopping = {"flag": False}
 

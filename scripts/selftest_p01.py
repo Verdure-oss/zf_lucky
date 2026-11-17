@@ -232,6 +232,32 @@ def main() -> int:
         ok = check("面板只列抽奖帖", all(r["is_lottery"] == 1 for r in panel), f"{len(panel)} 条")
         failures += 0 if ok else 1
 
+        # 回归：面板跑在独立线程，SQLite 连接不可跨线程共享。
+        # 曾出现「SQLite objects created in a thread can only be used in
+        # that same thread」，单线程 test client 测不出来。
+        print("\n[10] 跨线程访问")
+        import threading as _th
+
+        results = {}
+
+        def _worker(name):
+            try:
+                results[name] = len(db.list_for_panel())
+            except Exception as exc:
+                results[name] = f"ERR:{exc}"
+
+        threads = [_th.Thread(target=_worker, args=(f"t{i}",)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        ok = check(
+            "4 个线程并发查询均成功",
+            all(isinstance(v, int) for v in results.values()),
+            str(results),
+        )
+        failures += 0 if ok else 1
+
         db.close()
 
     print("\n" + "=" * 52)

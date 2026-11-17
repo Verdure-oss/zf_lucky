@@ -3,6 +3,3 @@ selenium==4.9.1
 
 # Web 面板
 flask==3.0.3
-
-# 可选：面板/调试用
-requests==2.31.0

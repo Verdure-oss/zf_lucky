@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -105,25 +106,46 @@ class Database:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        # 每线程一个连接：SQLite 连接不可跨线程共享。
+        # 注意不能用 threading.local().conns —— 该属性只对创建它的线程可见，
+        # 其他线程访问会抛 AttributeError。改用 线程id → 连接 的普通字典 + 锁。
+        self._conns: Dict[int, sqlite3.Connection] = {}
+        self._lock = threading.Lock()
 
     # ---------- 生命周期 ----------
 
     def connect(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.path, timeout=30)
-            self._conn.row_factory = sqlite3.Row
-            # WAL：面板读与主进程写不互相阻塞
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.executescript(SCHEMA)
-            self._conn.commit()
-            log.info("数据库就绪：%s", self.path)
-        return self._conn
+        """
+        获取当前线程的连接。
+
+        SQLite 连接不能跨线程共享（默认 check_same_thread=True）。
+        面板跑在独立线程、主流程在另一线程，因此**每个线程各持一个连接**。
+        用 threading.local() 隔离，避免「created in thread X」错误。
+
+        WAL 模式下多连接可同时读、单写，写入用 timeout 等待而非立即失败。
+        """
+        tid = threading.get_ident()
+        with self._lock:
+            conn = self._conns.get(tid)
+            if conn is None:
+                conn = sqlite3.connect(self.path, timeout=30)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.executescript(SCHEMA)
+                conn.commit()
+                self._conns[tid] = conn
+                log.debug("线程 %s 建立数据库连接", tid)
+        return conn
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """关闭当前线程的连接。"""
+        tid = threading.get_ident()
+        with self._lock:
+            conn = self._conns.pop(tid, None)
+        if conn is not None:
+            conn.close()
 
     @contextmanager
     def _cursor(self):

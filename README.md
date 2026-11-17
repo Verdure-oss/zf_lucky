@@ -61,19 +61,81 @@ zf_lucky/
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少填入 ZF_COOKIE
+# 编辑 .env，至少填入 ZF_COOKIE（从浏览器开发者工具复制整段 Cookie）
 
 docker compose up -d --build
 docker compose logs -f
 ```
 
-面板默认监听 `127.0.0.1:9997`，经反向代理访问。
+面板：`http://127.0.0.1:9997`（只绑回环，需经反向代理访问）
+
+### 反向代理（1Panel OpenResty）
+
+新建站点指向 `http://127.0.0.1:9997`：
+
+```nginx
+location ^~ / {
+    proxy_pass http://127.0.0.1:9997;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 120s;
+}
+```
+
+### 面板能做什么
+
+| 功能 | 说明 |
+|---|---|
+| 状态总览 | 已完成 / 待执行 / 失败 / 已放弃 / 未参与 |
+| 帖子列表 | 标题、作者、开奖时间、奖品、状态、关注/回复/点赞时间 |
+| 立即运行 | 写触发文件，由主循环串行执行 |
+| 暂停 / 恢复 | 暂停期间定时与手动触发都不会执行 |
+| 单帖重跑 | 清空该帖进度重新处理 |
+| 异常告警 | 验证码待处理、登录失效、限流、异常中止 |
+
+面板本身**不对站点发起任何操作**，唯一写动作是创建触发文件。
 
 ## 前置条件
 
-- 已绑手机号的 zFrontier 账号（站点要求绑定后才能回复）
+- 已绑手机号的 zFrontier 账号（站点要求绑定后才能回复，未绑会拒绝）
 - 宿主机有可用的 Selenium 容器，且与本项目在同一 docker 网络
 - Selenium 的 `4444` 端口**不要**对外暴露
+- 出现滑块验证码时，通过 noVNC（`127.0.0.1:7900`）手动完成
+
+## 运维
+
+```bash
+docker compose logs -f            # 看日志
+docker compose restart            # 改了 .env 后重启生效
+curl -X POST localhost:9997/api/run       # 手动触发一轮
+curl -X POST localhost:9997/api/pause \
+     -H 'Content-Type: application/json' \
+     -d '{"enable":true}'          # 暂停
+```
+
+数据在 `./data/zf_lucky.db`（SQLite，WAL 模式），备份该目录即可。
+
+## 自检
+
+每个功能都有可执行自检，改完代码应全绿：
+
+```bash
+# 离线（无需 selenium）
+python3 scripts/selftest_p01.py   # 配置 + 数据库
+python3 scripts/selftest_p03.py   # 扫描停止条件
+python3 scripts/selftest_p04.py   # 抽奖判定
+python3 scripts/selftest_p05.py   # 参与器（全用假 API）
+python3 scripts/selftest_p06.py   # 调度与编排
+python3 scripts/selftest_p1.py    # 面板
+
+# 需在 bili-net 网络内（连真实 Selenium）
+docker exec zf-lucky python scripts/selftest_p02.py
+```
+
 
 ## 底线
 
