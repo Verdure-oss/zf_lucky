@@ -1,0 +1,53 @@
+# zf_lucky 服务编排
+#
+# 设计原则：
+#   1. 不自带数据库：SQLite 落在 ./data，单文件、零运维；
+#   2. 浏览器复用宿主机既有的 bili-selenium 容器（原生 arm64 + noVNC），
+#      不新建第二个 Chromium，避免重复占内存与维护两套浏览器栈；
+#   3. 面板只绑回环，经 1Panel 反代 + HTTPS 暴露；
+#   4. selenuim 的 4444 与 noVNC 的 5900 都不在本文件暴露。
+
+services:
+  zf-lucky:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zf-lucky
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      DB_PATH: /app/data/zf_lucky.db
+      SELENIUM_URL: http://bili-selenium:4444
+      WAIT_TIMEOUT: "180"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      # 只绑回环。9997 空闲（9998=bili-panel，9999=bili-logs 已占用）
+      - "127.0.0.1:9997:8080"
+    networks:
+      - bili-net
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python -c "import os,sys;
+          sys.exit(0 if os.path.exists('/tmp/zf_lucky_trigger')
+          or os.path.isdir('/app/data') else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # 复用既有网络，外部网络不由此 compose 创建/删除
+  bili-net:
+    external: true
+    name: bili-net

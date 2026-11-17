@@ -51,6 +51,18 @@ def main() -> int:
     now = datetime(2026, 11, 17, 23, 59, 0)
     check("跨天到 00:05", seconds_until("00:05", now) == 360, f"{seconds_until('00:05', now)}")
 
+    # 回归：不能用「当前时间 + 浮点秒数」，会算出 08:59:59 并提前 1 秒触发
+    from app.main import next_run_at
+
+    now = datetime(2026, 11, 17, 20, 47, 55, 123456)
+    nxt = next_run_at("09:00", now)
+    check(
+        "下次运行时间精确为 09:00:00（无浮点误差）",
+        nxt == datetime(2026, 11, 18, 9, 0, 0),
+        str(nxt),
+    )
+    check("微秒为 0", nxt.microsecond == 0, str(nxt.microsecond))
+
     print("\n[2] 单实例锁")
     with tempfile.TemporaryDirectory() as tmp:
         lock_path = os.path.join(tmp, "test.lock")

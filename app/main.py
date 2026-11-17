@@ -95,6 +95,22 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def next_run_at(target: str, now: Optional[datetime] = None) -> datetime:
+    """
+    下一个 HH:MM 的**精确**时间点。
+
+    直接构造 datetime 而不是用「当前时间 + 浮点秒数」：
+    后者会因微秒累积导致算出来的时间比目标早不到 1 秒，
+    日志显示成 08:59:59，且调度循环会提前 1 秒触发。
+    """
+    now = now or datetime.now()
+    hh, mm = (int(x) for x in target.split(":"))
+    nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    return nxt
+
+
 def seconds_until(target: str, now: Optional[datetime] = None) -> float:
     """
     距离下一个 HH:MM 还有多少秒。
@@ -102,11 +118,7 @@ def seconds_until(target: str, now: Optional[datetime] = None) -> float:
     已经过了今天的点就排到明天。
     """
     now = now or datetime.now()
-    hh, mm = (int(x) for x in target.split(":"))
-    nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if nxt <= now:
-        nxt += timedelta(days=1)
-    return (nxt - now).total_seconds()
+    return (next_run_at(target, now) - now).total_seconds()
 
 
 def run_once(cfg, db: Database) -> None:
@@ -168,7 +180,7 @@ def main() -> int:
         log.info("RUN_ON_START=true，立即执行一轮")
         run_once(cfg, db)
 
-    next_run = datetime.now() + timedelta(seconds=seconds_until(cfg.run_at))
+    next_run = next_run_at(cfg.run_at)
     log.info("下次定时运行：%s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
 
     while not stopping["flag"]:
@@ -179,9 +191,7 @@ def main() -> int:
                     log.error("配置不完整，忽略手动触发")
                 else:
                     run_once(cfg, db)
-                    next_run = datetime.now() + timedelta(
-                        seconds=seconds_until(cfg.run_at)
-                    )
+                    next_run = next_run_at(cfg.run_at)
                     log.info("下次定时运行：%s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
 
             if datetime.now() >= next_run:
@@ -189,7 +199,7 @@ def main() -> int:
                     log.error("配置不完整，跳过定时运行")
                 else:
                     run_once(cfg, db)
-                next_run = datetime.now() + timedelta(seconds=seconds_until(cfg.run_at))
+                next_run = next_run_at(cfg.run_at)
                 log.info("下次定时运行：%s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
 
         except Exception:
