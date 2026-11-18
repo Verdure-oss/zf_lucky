@@ -122,8 +122,14 @@ class Driver:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-extensions")
-        options.add_argument("--window-size=1600,1200")
         options.add_argument("--lang=zh-CN")
+        # 窗口位置与尺寸：bili-selenium 的多个会话共享同一个 X display(:99)，
+        # 若都堆在默认位置会互相遮挡、难以在 noVNC 里分辨。
+        # zf_lucky 固定占左上角并留出明显偏移，与其他程序错开。
+        options.add_argument("--window-size=1500,1150")
+        options.add_argument("--window-position=0,0")
+        # 顶部显示「[ZF]」前缀，noVNC 里一眼可辨归属
+        options.add_argument("--app-name=ZF-lucky")
         # 关掉 「Chrome 正受自动测试软件控制」 提示条，减少显眼的自动化特征
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
@@ -189,6 +195,8 @@ class Driver:
             try:
                 self.raw.get(url)
                 self.wait_ready()
+                # 每次导航后重打标记：标题与顶部色条会随页面刷新丢失
+                self.mark_window()
                 return
             except (TimeoutException, WebDriverException) as exc:
                 last = exc
@@ -220,6 +228,41 @@ class Driver:
                 pass
             time.sleep(0.6)
         return False
+
+    def mark_window(self, label: str = "ZF") -> None:
+        """
+        给窗口打可视标记，便于在共享屏幕的 noVNC 里辨认。
+
+        bili-selenium 的多个会话共用一个 X display(:99)，
+        同一屏幕上可能同时有别的程序的浏览器窗口。
+        这里做两件事：
+          1. 页面标题加前缀（标签栏可见）
+          2. 页面顶部插入一条彩色细条（内容区可见）
+        两者都只在本次页面有效，导航后失效，所以需要每次 get 后调用。
+        """
+        try:
+            self.raw.execute_script(
+                """
+                try {
+                    if (document.title.indexOf(arguments[0]) !== 0) {
+                        document.title = '[' + arguments[0] + '] ' + document.title;
+                    }
+                    if (!document.getElementById('__zf_mark')) {
+                        var bar = document.createElement('div');
+                        bar.id = '__zf_mark';
+                        bar.textContent = arguments[0] + ' · zf_lucky';
+                        bar.style.cssText =
+                            'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
+                          + 'background:#02c39a;color:#04120e;font:700 12px/20px sans-serif;'
+                          + 'text-align:center;pointer-events:none;opacity:.92';
+                        (document.body || document.documentElement).appendChild(bar);
+                    }
+                } catch (e) {}
+                """,
+                label,
+            )
+        except WebDriverException:
+            pass
 
     def current_url(self) -> str:
         return self.raw.current_url
