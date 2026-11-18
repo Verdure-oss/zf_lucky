@@ -1,19 +1,21 @@
 """
-参与执行器：关注 → 回复 → 点赞。
+参与执行器（真实点击版）：关注 → 回复 → 点赞。
 
-三条不可妥协的原则：
+与旧版的根本区别：
 
-1. **顺序固定：先关注、再回复、最后点赞。**
-   点赞放最后，使 has_zan==1 在语义上蕴含「回复也已成功」，
-   不会出现「赞了但没回复」的永久漏帖。
-   （若反过来，中途失败会导致第二天看到已点赞而跳过，永久错过这帖。）
+  旧版：只打开列表页，然后在页面里 fetch() 调接口。
+        浏览器只是个"能带 Cookie 的 HTTP 客户端"，一次真实点击都没有，
+        所以在 noVNC 里永远看不到任何动作。
 
-2. **每一步都要回读服务端状态确认，不信任接口返回码。**
-   接口返回 ok=0 不等于业务真的生效——审核吞掉、限流静默拦截都可能发生。
-   关注回读 followed==1，回复回读列表里能找到自己的 uid，点赞回读 has_zan==1。
+  新版：真开帖子页、真点按钮、真往富文本编辑器里打字、真点发送。
+        每一步都能在浏览器里看到，行为也更接近真人。
 
-3. **失败只影响当前帖，不中断整轮。**
-   单帖失败记为 failed，下一轮自动重试；只有限流/验证码/登录失效才中止整轮。
+判定成功仍靠回读服务端状态（点击本身不可信：
+可能被遮挡、可能点击了但接口没生效），只是"动作"改成真实交互。
+
+为什么顺序是 关注 → 回复 → 点赞：
+  点赞放最后，使 has_zan==1 在语义上蕴含"回复也已完成"，
+  杜绝"赞了但没回复"的永久漏帖。
 """
 
 from __future__ import annotations
@@ -28,6 +30,13 @@ from ..db import STATE_DONE, STATE_FAILED, STATE_GIVE_UP
 from .api import Api, ApiError, CaptchaRequired, RateLimited, SessionExpired
 
 log = logging.getLogger(__name__)
+
+# 帖子页关键选择器（实测自真实页面）
+SEL_ZAN = ".target_zan-flow"
+SEL_EDITOR = ".target_comment-editor"
+SEL_QUILL = SEL_EDITOR + " .ql-editor"
+SEL_FAST_SUBMIT = "a.plugin-btn.submit"
+SEL_AUTHOR_LINK = 'a[href*="/app/user/"]'
 
 
 class StepError(RuntimeError):
@@ -52,193 +61,41 @@ class ParticipateResult:
 
 
 class Participant:
-    """负责把一条抽奖帖参与完。"""
+    """通过真实浏览器交互完成一条抽奖帖的参与。"""
 
     def __init__(
         self,
+        driver,
         api: Api,
         db,
         corpus: Corpus,
         my_uid: int,
         max_retry: int = 3,
         write_budget: int = 30,
+        delay_min: int = 2,
+        delay_max: int = 5,
     ):
+        self.driver = driver
         self.api = api
         self.db = db
         self.corpus = corpus
         self.my_uid = my_uid
         self.max_retry = max_retry
         self.write_budget = write_budget
+        self.delay_min = delay_min
+        self.delay_max = delay_max
         self.write_used = 0
-        # 当前处理的帖子 hash。放在实例上而非类属性：
-        # 类属性会被所有实例共享，多帖串行时互相覆盖。
         self._current_hash: str = ""
 
-    # ---------- 关注 ----------
+    # ---------- 通用 ----------
 
-    def ensure_followed(self, author_uid: int, author_hash: Optional[str]) -> None:
-        """
-        确保已关注作者。已关注则跳过。
+    def _pause(self, lo: Optional[int] = None, hi: Optional[int] = None) -> None:
+        """随机停顿，让节奏像人而不是脚本。"""
+        import random
 
-        回读确认：/v2/user/detail 返回的 user.followed 必须是 1。
-        """
-        # 先查当前关注状态，避免重复关注
-        followed = None
-        if author_hash:
-            detail = self.api.user_detail(author_hash)
-            user = detail.get("user") or {}
-            if "followed" in user:
-                followed = int(user.get("followed") or 0)
-
-        if followed == 1:
-            log.info("  已关注作者 %s，跳过", author_uid)
-            return
-
-        self._consume_write()
-        self.api.follow(author_uid)
-        log.info("  已发送关注请求：%s", author_uid)
-
-        # 回读确认
-        if not author_hash:
-            raise StepError("缺少作者 hash，无法确认关注状态")
-
-        for attempt in range(3):
-            detail = self.api.user_detail(author_hash)
-            user = detail.get("user") or {}
-            if int(user.get("followed") or 0) == 1:
-                log.info("  关注已确认：%s", author_uid)
-                return
-            import time
-
-            time.sleep(1.5 + attempt)
-        raise StepError(f"关注 {author_uid} 后回读仍为未关注")
-
-    # ---------- 回复 ----------
-
-    def send_reply(self, flow_id: int) -> Dict[str, Any]:
-        """
-        发回复并回读确认。
-
-        回读用 unfold=1：抽奖帖默认折叠抽奖楼层，
-        不展开的话查不到自己那条，会误判为「回复失败」进而重复回复。
-        """
-        content = self.corpus.pick()
-        self._consume_write()
-        data = self.api.reply(flow_id, content)
-        reply = data.get("reply") or {}
-        reply_id = reply.get("id")
-        floor = reply.get("floor")
-        log.info("  已发送回复（id=%s, floor=%s）：%s", reply_id, floor, content)
-
-        if not self._find_my_reply(flow_id):
-            raise StepError("回复后回读未找到本人的回复")
-        log.info("  回复已确认存在于服务端")
-        return {"reply_id": reply_id, "floor": floor, "content": content}
-
-    def _find_my_reply(self, flow_id: int, max_pages: int = 3) -> bool:
-        """
-        在回复列表里找本人的回复。
-
-        默认按最新排序，本人的刚发的通常在前两页；
-        最多翻 3 页避免在几百条回复的帖子上耗太久。
-        """
-        import time
-
-        for page in range(1, max_pages + 1):
-            data = self.api.flow_reply_list(flow_id, page=page)
-            items = data.get("list") or []
-            for item in items:
-                if int(item.get("uid") or 0) == self.my_uid:
-                    return True
-            if not data.get("has_more"):
-                return False
-            time.sleep(1)
-        return False
-
-    # ---------- 点赞 ----------
-
-    def like_flow(self, flow_id: int) -> None:
-        """
-        点赞并回读确认。
-
-        必须先查 has_zan：已点赞的再点会变成取消赞，
-        反而把「已参与」标记抹掉。
-
-        ⚠️ 回读**不能只看 flow_detail 的 has_zan**：
-        实测该字段有明显的读缓存，点赞成功后 16 秒甚至 30 秒以上仍是 0，
-        而 zanFlow 早已返回「已赞」。这会导致「点赞成功却判失败」，
-        并让这帖进入重试——下次运行会再点一次，反而变成取消赞，抹掉标记。
-
-        改用 /v2/user/zan/list（我的点赞列表）核对：
-        实测点赞后立刻就能在列表里查到目标帖，无缓存延迟。
-        这是「服务端确实记录了我的赞」的直接证据，比 has_zan 可靠得多。
-        """
-        info = self.api.flow_detail(self._current_hash)
-        flow = info.get("flow") or {}
-        if int(flow.get("has_zan") or 0) == 1:
-            log.info("  已点赞，跳过")
-            return
-
-        # 先查点赞列表兜底：可能 has_zan 只是缓存没刷新，其实早就赞过
-        if self._in_watchlist(self._current_hash):
-            log.info("  点赞列表已存在该帖（has_zan 为缓存旧值），跳过")
-            return
-
-        self._consume_write()
-        result = self.api.zan_flow(flow_id)
-        msg = (result or {}).get("msg") or ""
-        log.info("  已发送点赞请求（%s）", msg or "ok")
-
-        # 主判据：点赞列表
-        for attempt, wait in enumerate((1, 2, 3, 5), start=1):
-            if self._in_watchlist(self._current_hash):
-                log.info("  点赞已确认（列表核对，第 %d 次）", attempt)
-                return
-            time.sleep(wait)
-
-        # 兜底判据：has_zan（有缓存，可能滞后）
-        for wait in (3, 6):
-            time.sleep(wait)
-            flow = (self.api.flow_detail(self._current_hash).get("flow") or {})
-            if int(flow.get("has_zan") or 0) == 1:
-                log.info("  点赞已确认（has_zan，滞后刷新）")
-                return
-
-        # zanFlow 明确回了「已赞」也算成功：站点已接受，只是两个读接口都没及时更新
-        if "已赞" in msg:
-            log.warning(
-                "  点赞接口返回「已赞」但列表与 has_zan 均未及时反映，"
-                "按成功处理（避免下次重试反而取消赞）"
-            )
-            return
-
-        raise StepError("点赞后无法确认（列表与 has_zan 均未反映）")
-
-    def _in_watchlist(self, hash_: str, pages: int = 2) -> bool:
-        """
-        在「我的点赞列表」里查找指定帖子。
-
-        只看前几页：刚点的赞一定在最前面，没必要翻很多页。
-        """
-        for page in range(1, pages + 1):
-            try:
-                data = self.api.post("/v2/user/zan/list", {"page": page}) or {}
-            except ApiError as exc:
-                log.debug("查询点赞列表失败（page=%d）：%s", page, exc)
-                return False
-            items = data.get("list") or []
-            for item in items:
-                h = item.get("hash_id")
-                if not h:
-                    flow = item.get("flow") or {}
-                    h = flow.get("hash_id")
-                if h == hash_:
-                    return True
-            if not items:
-                break
-        return False
-
-    # ---------- 预算 ----------
+        lo = self.delay_min if lo is None else lo
+        hi = self.delay_max if hi is None else hi
+        time.sleep(random.uniform(lo, max(lo, hi)))
 
     def _consume_write(self) -> None:
         if self.write_used >= self.write_budget:
@@ -247,18 +104,257 @@ class Participant:
             )
         self.write_used += 1
 
-    @property
-    def budget_left(self) -> int:
-        return max(0, self.write_budget - self.write_used)
+    def _open_flow(self, hash_: str) -> None:
+        """打开帖子详情页并等评论区渲染完成。"""
+        url = f"https://www.zfrontier.com/app/flow/{hash_}"
+        self.driver.get(url)
+        # 评论区是异步渲染的，等编辑器出现才算就绪
+        if not self.driver.wait_selector(SEL_EDITOR, timeout=20):
+            raise StepError("帖子页评论区未渲染（编辑器未出现）")
+        self._pause(1, 2)
+
+    # ---------- 关注 ----------
+
+    def ensure_followed(self, author_hash: Optional[str], author_uid: int) -> None:
+        """
+        确保已关注作者——真实点击作者名进主页，再点关注按钮。
+
+        已关注则跳过。关注后回读 /v2/user/detail 的 followed 确认。
+        """
+        if not author_hash:
+            raise StepError("缺少作者 hash，无法执行关注")
+
+        # 先查当前状态，已关注就不必再进主页
+        user = (self.api.user_detail(author_hash) or {}).get("user") or {}
+        if user.get("followed"):
+            log.info("  已关注作者 %s，跳过", author_uid)
+            return
+
+        # 真实操作：点作者名进入主页
+        try:
+            link = self.driver.find(SEL_AUTHOR_LINK, timeout=10)
+        except Exception as exc:
+            raise StepError(f"未找到作者主页链接：{exc}") from exc
+
+        self._consume_write()
+        kind = self.driver.safe_click(link, "作者名")
+        if kind == "failed":
+            raise StepError("点击作者名失败")
+
+        # 主页是新标签还是本页跳转，两种都处理
+        try:
+            handles = self.driver.raw.window_handles
+            if len(handles) > 1:
+                self.driver.raw.switch_to.window(handles[-1])
+            self.driver.wait_ready()
+        except Exception as exc:
+            log.debug("切换作者主页窗口失败：%s", exc)
+
+        # 主页上找关注按钮并点击
+        follow_sel = ".bt-green-border.follow"
+        try:
+            btn = self.driver.find(follow_sel, timeout=15)
+        except Exception as exc:
+            raise StepError(f"作者主页未找到关注按钮：{exc}") from exc
+
+        text = (btn.text or "").strip()
+        log.info("  关注按钮文案：%r", text)
+        if "已关注" not in text:
+            self.driver.safe_click(btn, "关注按钮")
+            log.info("  已点击关注按钮")
+            self._pause(2, 3)
+
+        # 回读确认
+        for attempt in range(4):
+            user = (self.api.user_detail(author_hash) or {}).get("user") or {}
+            if user.get("followed"):
+                log.info("  关注已确认（第 %d 次回读）", attempt + 1)
+                self._close_extra_tabs()
+                return
+            time.sleep(2 + attempt)
+
+        raise StepError(f"关注 {author_uid} 后回读仍为未关注")
+
+    def _close_extra_tabs(self) -> None:
+        """关掉关注时可能打开的新标签，回到帖子页。"""
+        try:
+            while len(self.driver.raw.window_handles) > 1:
+                self.driver.raw.switch_to.window(self.driver.raw.window_handles[-1])
+                self.driver.raw.close()
+            self.driver.raw.switch_to.window(self.driver.raw.window_handles[0])
+        except Exception as exc:
+            log.debug("关闭多余标签失败：%s", exc)
+
+    # ---------- 回复 ----------
+
+    def send_reply(self, flow_id: int, hash_: str) -> Dict[str, Any]:
+        """
+        发回复——真实点编辑器、真实打字、真实点发送。
+
+        优先用站点自带的快捷按钮（抽奖帖有「点击抽奖」，内容为冲冲冲），
+        避免往富文本里塞内容时被站点校验拦掉。
+        """
+        content = self.corpus.pick()
+
+        # 确保在帖子页
+        if hash_ not in (self.driver.current_url() or ""):
+            self._open_flow(hash_)
+
+        self._consume_write()
+
+        # 方式一：快捷提交按钮（抽奖帖专有，最稳）
+        used_fast = False
+        try:
+            fasts = self.driver.find_all(SEL_FAST_SUBMIT)
+            fast = next(
+                (f for f in fasts if "抽奖" in (f.text or "") or f.is_displayed()),
+                None,
+            )
+            if fast is not None:
+                self.driver.safe_click(fast, "快捷回复按钮")
+                used_fast = True
+                log.info("  已点击站点快捷回复按钮：%r", (fast.text or "").strip())
+        except Exception as exc:
+            log.debug("快捷按钮不可用，改用编辑器：%s", exc)
+
+        # 方式二：点编辑器 → 输入 → 点发送
+        if not used_fast:
+            try:
+                editor = self.driver.find(SEL_QUILL, timeout=10)
+            except Exception as exc:
+                raise StepError(f"未找到回复输入框：{exc}") from exc
+
+            self.driver.safe_click(editor, "回复输入框")
+            self._pause(1, 2)
+
+            # Quill 是 contenteditable，send_keys 有时不进内容，先聚焦再输入
+            try:
+                self.driver.raw.execute_script(
+                    "arguments[0].focus();"
+                    "var r=document.createRange();r.selectNodeContents(arguments[0]);"
+                    "r.collapse(false);var s=window.getSelection();"
+                    "s.removeAllRanges();s.addRange(r);",
+                    editor,
+                )
+            except Exception:
+                pass
+            editor.send_keys(content)
+            self._pause(1, 2)
+            log.info("  已输入回复内容：%r", content)
+
+            # 找发送按钮
+            submit = None
+            for sel in ("a.plugin-btn.submit", "button.button-black", ".editor .button"):
+                try:
+                    cands = self.driver.find_all(sel)
+                    submit = next(
+                        (c for c in cands if (c.text or "").strip() in ("发送", "回复", "")),
+                        cands[0] if cands else None,
+                    )
+                    if submit is not None:
+                        break
+                except Exception:
+                    continue
+            if submit is None:
+                raise StepError("未找到发送按钮")
+            self.driver.safe_click(submit, "发送按钮")
+
+        log.info("  已发送回复")
+
+        # 回读：抽奖帖回复楼层会被折叠，必须 unfold=1
+        for attempt in range(5):
+            time.sleep(2 + attempt)
+            if self._find_my_reply(flow_id):
+                log.info("  回复已确认（第 %d 次回读）", attempt + 1)
+                info = self._latest_my_reply(flow_id)
+                return {
+                    "reply_id": info.get("id"),
+                    "floor": info.get("floor"),
+                    "content": content,
+                }
+        raise StepError("回复后回读未找到本人回复")
+
+    def _find_my_reply(self, flow_id: int) -> bool:
+        return self._latest_my_reply(flow_id) is not None
+
+    def _latest_my_reply(self, flow_id: int) -> Optional[Dict[str, Any]]:
+        """在回复列表里找本人最新一条。"""
+        for page in (1, 2):
+            try:
+                data = self.api.flow_reply_list(flow_id, page=page)
+            except ApiError as exc:
+                log.debug("查回复列表失败：%s", exc)
+                return None
+            for item in data.get("list") or []:
+                if int(item.get("uid") or 0) == self.my_uid:
+                    return item
+            if not data.get("has_more"):
+                break
+        return None
+
+    # ---------- 点赞 ----------
+
+    def like_flow(self, flow_id: int, hash_: str) -> None:
+        """
+        点赞——真实点那个 👍 图标。
+
+        先确认未赞（已赞再点会变取消赞，反而抹掉标记），
+        点完用点赞列表核对（has_zan 有读缓存，实测 16~30 秒才刷新）。
+        """
+        if self._in_watchlist(hash_):
+            log.info("  点赞列表已有，跳过")
+            return
+
+        if hash_ not in (self.driver.current_url() or ""):
+            self._open_flow(hash_)
+
+        try:
+            zan = self.driver.find(SEL_ZAN, timeout=10)
+        except Exception as exc:
+            raise StepError(f"未找到点赞按钮：{exc}") from exc
+
+        cls = zan.get_attribute("class") or ""
+        if "active" in cls:
+            log.info("  按钮已处于点赞态，跳过")
+            return
+
+        self._consume_write()
+        self.driver.safe_click(zan, "点赞按钮")
+        log.info("  已点击点赞按钮")
+
+        for attempt in range(5):
+            time.sleep(2 + attempt)
+            if self._in_watchlist(hash_):
+                log.info("  点赞已确认（列表核对，第 %d 次）", attempt + 1)
+                return
+        # 兜底看 has_zan
+        for wait in (3, 6):
+            time.sleep(wait)
+            flow = (self.api.flow_detail(hash_).get("flow") or {})
+            if int(flow.get("has_zan") or 0) == 1:
+                log.info("  点赞已确认（has_zan）")
+                return
+        raise StepError("点赞后无法确认（列表与 has_zan 均未反映）")
+
+    def _in_watchlist(self, hash_: str, pages: int = 3) -> bool:
+        for page in range(1, pages + 1):
+            try:
+                data = self.api.post("/v2/user/zan/list", {"page": page}) or {}
+            except ApiError:
+                return False
+            items = data.get("list") or []
+            if not items:
+                break
+            for it in items:
+                h = it.get("hash_id") or (it.get("flow") or {}).get("hash_id")
+                if h == hash_:
+                    return True
+        return False
 
     # ---------- 主流程 ----------
 
     def participate(self, flow_row: Dict[str, Any]) -> ParticipateResult:
-        """
-        对一条抽奖帖完成关注+回复+点赞。
-
-        注意：调用方负责在开始时把 state 置为 pending。
-        """
+        """对一条抽奖帖完成关注+回复+点赞（真实点击）。"""
         hash_ = flow_row["hash"]
         self._current_hash = hash_
         flow_id = flow_row.get("flow_id")
@@ -271,47 +367,51 @@ class Participant:
             result.fail_reason = "缺少 flow_id"
             self._on_fail(hash_, result.fail_reason)
             return result
-        if not author_uid:
-            result.fail_reason = "缺少作者 uid，无法关注"
-            self._on_fail(hash_, result.fail_reason)
-            return result
 
         try:
-            # 断点续跑：失败重试时不要重复已经成功的动作。
-            #
-            # 为什么必须这么做：回复是不可撤销的公开动作，重复回复等于刷屏，
-            # 且这条帖子会被作者看到。实测出现过「回复成功、点赞判失败」，
-            # 若不记录已完成步骤，下次重试会再回复一遍。
+            # 打开帖子页（后续关注/回复/点赞都在这个页面上操作）
+            self._open_flow(hash_)
+            result.steps.append("open")
+
             done = self.db.get_participation(hash_) or {}
 
-            # 1. 关注（已关注则跳过，ensure_followed 内部也会再校验一次）
+            # 1. 关注（已完成则跳过，绝不重复）
             if not done.get("followed_at"):
-                self.ensure_followed(int(author_uid), author_hash)
+                if author_uid:
+                    self.ensure_followed(author_hash, int(author_uid))
                 self.db.mark_followed(hash_)
                 result.steps.append("follow")
+                # 关注会跳走，回来重新开帖
+                self._open_flow(hash_)
             else:
                 log.info("  关注已完成过，跳过")
 
-            # 2. 回复（已完成则绝对不能再发）
+            # 2. 回复（已完成则绝不重复——回复不可撤销）
             if not done.get("replied_at"):
-                reply_info = self.send_reply(int(flow_id))
-                self.db.mark_replied(hash_, reply_info["reply_id"], reply_info["floor"])
+                info = self.send_reply(int(flow_id), hash_)
+                self.db.mark_replied(hash_, info["reply_id"], info["floor"])
                 result.steps.append("reply")
-                result.reply_id = reply_info["reply_id"]
-                result.floor = reply_info["floor"]
+                result.reply_id = info["reply_id"]
+                result.floor = info["floor"]
             else:
                 log.info("  回复已完成过（reply_id=%s），跳过", done.get("reply_id"))
                 result.reply_id = done.get("reply_id")
                 result.floor = done.get("reply_floor")
 
             # 3. 点赞
-            self.like_flow(int(flow_id))
+            self.like_flow(int(flow_id), hash_)
             self.db.mark_liked(hash_)
             result.steps.append("like")
 
             self.db.mark_state(hash_, STATE_DONE)
             result.success = True
             log.info("✅ 参与完成：%s（%s）", hash_, " → ".join(result.steps))
+            return result
+
+        except BudgetExhausted as exc:
+            result.fail_reason = str(exc)
+            result.aborted = f"budget: {exc}"
+            log.error("写操作预算耗尽，中止整轮：%s", exc)
             return result
 
         except CaptchaRequired as exc:
@@ -335,33 +435,27 @@ class Participant:
             log.error("登录失效，中止：%s", exc)
             return result
 
-        except BudgetExhausted as exc:
-            result.fail_reason = str(exc)
-            result.aborted = f"budget: {exc}"
-            # 预算耗尽不是这帖的问题，不记失败、不消耗重试
-            log.error("写操作预算耗尽，中止整轮：%s", exc)
-            return result
-
         except (StepError, ApiError) as exc:
             result.fail_reason = str(exc)
             self._on_fail(hash_, result.fail_reason)
             log.warning("参与失败 %s：%s（已完成 %s）", hash_, exc, result.steps or "无")
             return result
 
-        except Exception as exc:  # 防御
+        except Exception as exc:
             result.fail_reason = f"{type(exc).__name__}: {exc}"
             self._on_fail(hash_, result.fail_reason)
             log.exception("参与 %s 出现未预期错误", hash_)
             return result
 
     def _on_fail(self, hash_: str, reason: str, count_retry: bool = True) -> None:
-        """记录失败；重试用尽则置 give_up。"""
         if count_retry:
             cnt = self.db.bump_retry(hash_, reason)
             if cnt >= self.max_retry:
                 self.db.mark_state(hash_, STATE_GIVE_UP, reason)
                 log.warning("已连续失败 %d 次，标记放弃：%s", cnt, hash_)
         else:
-            # 限流/验证码/登录失效不是帖子本身的问题，重试也不会好，
-            # 因此只记录原因，不消耗重试次数
             self.db.mark_failed_no_retry(hash_, reason)
+
+    @property
+    def budget_left(self) -> int:
+        return max(0, self.write_budget - self.write_used)

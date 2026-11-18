@@ -163,6 +163,7 @@ class Runner:
 
         log.info("待参与：%d 条", len(todos))
         participant = Participant(
+            driver=self.driver,
             api=Api(
                 self.driver,
                 delay_min=self.cfg.request_delay_min,
@@ -173,6 +174,8 @@ class Runner:
             my_uid=session.uid or 0,
             max_retry=self.cfg.max_retry,
             write_budget=self.cfg.max_write_per_run,
+            delay_min=self.cfg.request_delay_min,
+            delay_max=self.cfg.request_delay_max,
         )
 
         for idx, row in enumerate(todos, 1):

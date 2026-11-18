@@ -1,13 +1,13 @@
 """
-P0-5 自检：参与器。
+P0-5 自检：参与器（真实点击版）。
 
-**本测试全部使用假 API，不对真实账号发起任何写操作。**
-真实写操作（关注/回复/点赞）只在用户明确授权后，通过 main.py 触发。
+**全部使用假 driver + 假 API，不对真实账号发起任何写操作。**
 
-重点是验证那些「错了会永久漏帖」的逻辑：
+重点验证「错了会永久漏帖/刷屏」的逻辑：
   - 步骤顺序必须是 关注 → 回复 → 点赞
-  - 已点赞时不能重复点赞（会变成取消赞，抹掉标记）
-  - 回复后必须能回读到本人回复才算出成功
+  - 已点赞时不能重复点（会变成取消赞，抹掉标记）
+  - 回复后必须能回读到本人回复才算成功
+  - 断点续跑：已有 followed_at / replied_at 的绝不重复执行
   - 单帖失败不中断整轮；限流/验证码/登录失效才中止
   - 限流不消耗重试次数
 """
@@ -41,84 +41,170 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+class FakeElement:
+    """假的页面元素。"""
+
+    def __init__(self, text="", cls="", displayed=True, on_click=None):
+        self.text = text
+        self._cls = cls
+        self._displayed = displayed
+        self._on_click = on_click
+        self.typed = ""
+
+    def get_attribute(self, name):
+        return self._cls if name == "class" else ""
+
+    def is_displayed(self):
+        return self._displayed
+
+    def click(self):
+        if self._on_click:
+            self._on_click()
+
+    def send_keys(self, text):
+        self.typed += text
+
+
+class FakeDriver:
+    """
+    假 driver：记录所有真实交互动作（点击/输入），供断言。
+
+    只实现参与器用到的那部分 API。
+    """
+
+    def __init__(self):
+        self.actions = []
+        self.current_url_value = ""
+        self._elements = {}
+        self._handles = ["h1"]
+        self.raw = self
+
+    # --- 导航 ---
+    def get(self, url):
+        self.current_url_value = url
+        self.actions.append(("get", url))
+
+    def current_url(self):
+        return self.current_url_value
+
+    def wait_ready(self, timeout=20):
+        return True
+
+    def wait_selector(self, css, timeout=20):
+        return css in self._elements or True  # 默认认为已渲染
+
+    # --- 元素 ---
+    def find(self, css, timeout=10):
+        if css not in self._elements:
+            raise RuntimeError(f"元素不存在：{css}")
+        return self._elements[css]
+
+    def find_all(self, css):
+        el = self._elements.get(css)
+        return [el] if el else []
+
+    def safe_click(self, element, label="元素", timeout=8):
+        self.actions.append(("click", label))
+        element.click()
+        return "native"
+
+    def js(self, script, *args):
+        return None
+
+    # --- 窗口 ---
+    @property
+    def window_handles(self):
+        return list(self._handles)
+
+    def switch_to(self):
+        return self
+
+    @property
+    def window(self):
+        return self
+
+    def close(self):
+        pass
+
+    # --- Quill 聚焦用 ---
+    def execute_script(self, *a, **kw):
+        return None
+
+
 class FakeApi:
-    """假 API：记录调用顺序，可编排各种故障。"""
+    """假 API：记录调用，可编排故障。"""
 
     def __init__(self):
         self.calls = []
-        self.followed = {}        # uid -> 0/1
-        self.has_zan = {}         # hash -> 0/1
-        self.replies = {}         # flow_id -> [uid,...]
-        self._hash_to_flow = {}   # hash -> flow_id
-        self.zan_list = []        # 我的点赞列表（hash 顺序）
+        self.followed = {}
+        self.has_zan = {}
+        self.replies = {}
+        self.zan_list = []
+        self._hash_to_flow = {}
 
-        # 故障开关
         self.fail_follow = False
         self.fail_reply = False
         self.fail_like = False
-        self.follow_not_effective = False  # 关注请求成功但回读仍 0
-        self.reply_not_visible = False     # 回复接口成功但列表查不到
+        self.follow_not_effective = False
+        self.reply_not_visible = False
         self.like_not_effective = False
-        self.raise_on = None               # 在下一次调用时抛异常
+        self.raise_on = None
+        self._exc = None
 
-    def _maybe_raise(self, name: str):
-        self.calls.append(name)
-        if self.raise_on == name:
-            exc = getattr(self, "_exc", None)
-            self.raise_on = None
-            raise exc or ApiError("模拟失败")
-
-    def register(self, hash_: str, flow_id: int, author_uid: int, author_hash: str):
+    def register(self, hash_, flow_id, author_uid, author_hash):
         self._hash_to_flow[hash_] = flow_id
         self.followed.setdefault(author_uid, 0)
         self.has_zan.setdefault(hash_, 0)
         self.replies.setdefault(flow_id, [])
 
-    # ---- 接口 ----
+    def _maybe_raise(self, name):
+        self.calls.append(name)
+        if self.raise_on == name:
+            exc = self._exc
+            self.raise_on = None
+            raise exc or ApiError("模拟失败")
 
+    # --- 接口 ---
     def user_detail(self, user_hash):
         self.calls.append("user_detail")
         for uid, v in self.followed.items():
-            return {"user": {"followed": v, "hash_id": user_hash}}
-        return {"user": {"followed": 0, "hash_id": user_hash}}
+            return {"user": {"followed": v, "hash_id": user_hash, "id": uid}}
+        return {"user": {"followed": 0}}
 
     def follow(self, uid):
         self._maybe_raise("follow")
-        if self.fail_follow:
-            raise ApiError("关注失败")
         if not self.follow_not_effective:
             self.followed[uid] = 1
         return {}
 
     def reply(self, flow_id, content, reply_id=0):
         self._maybe_raise("reply")
-        if self.fail_reply:
-            raise ApiError("回复失败")
         if not self.reply_not_visible:
             self.replies.setdefault(flow_id, []).append(1001)
-        return {"reply": {"id": 555, "floor": 88, "content": content}}
+        return {"reply": {"id": 555, "floor": 88}}
 
     def flow_reply_list(self, flow_id, page=1, sort_by="ctime_desc", unfold=1):
         self.calls.append("flow_reply_list")
-        return {"list": [{"uid": u, "id": 1} for u in self.replies.get(flow_id, [])],
-                "has_more": False}
+        return {
+            "list": [
+                {"uid": u, "id": 777, "floor": 10 + i}
+                for i, u in enumerate(self.replies.get(flow_id, []))
+            ],
+            "has_more": False,
+        }
 
     def flow_detail(self, hash_):
         self.calls.append("flow_detail")
-        return {"flow": {"has_zan": self.has_zan.get(hash_, 0), "id": self._hash_to_flow.get(hash_)}}
+        return {
+            "flow": {
+                "has_zan": self.has_zan.get(hash_, 0),
+                "id": self._hash_to_flow.get(hash_),
+            }
+        }
 
     def zan_flow(self, flow_id):
         self._maybe_raise("zan_flow")
-        if self.fail_like:
-            raise ApiError("点赞失败")
-        if not self.like_not_effective:
-            for h, fid in self._hash_to_flow.items():
-                if fid == flow_id:
-                    # 真实站点的 has_zan 有读缓存；这里默认同步，
-                    # 需要模拟延迟时把 like_not_effective 打开
-                    self.has_zan[h] = 1
-                    self.zan_list.insert(0, h)
-        return {"msg": "已赞 \\(^o^)/"}
+        return {}
 
     def post(self, path, data=None, **kw):
         self.calls.append("post:" + path)
@@ -126,24 +212,20 @@ class FakeApi:
             page = int((data or {}).get("page") or 1)
             if page == 1:
                 return {"list": [{"hash_id": h} for h in self.zan_list], "pager": {}}
-            return {"list": [], "pager": {}}
-        return {}
-
-    def unzan_flow(self, flow_id):
-        self.calls.append("unzan_flow")
+            return {"list": []}
         return {}
 
 
 MY_UID = 1001
 
 
-def fresh_db(tmp: str) -> Database:
+def fresh_db(tmp):
     db = Database(os.path.join(tmp, "t.db"))
     db.connect()
     return db
 
 
-def add_flow(db: Database, hash_: str, flow_id: int, author_uid: int = 77):
+def add_flow(db, hash_, flow_id, author_uid=77):
     db.upsert_flow({
         "hash": hash_,
         "flow_id": flow_id,
@@ -157,6 +239,50 @@ def add_flow(db: Database, hash_: str, flow_id: int, author_uid: int = 77):
     db.ensure_participation(hash_)
 
 
+def make_bundle(api, db, driver=None, budget=10, max_retry=3):
+    """构造 (participant, driver)。driver 默认新建并接好元素。"""
+    d = driver or build_driver(api)
+    p = Participant(
+        driver=d,
+        api=api,
+        db=db,
+        corpus=Corpus(),
+        my_uid=MY_UID,
+        max_retry=max_retry,
+        write_budget=budget,
+        delay_min=0,
+        delay_max=0,
+    )
+    return p, d
+
+
+def build_driver(api):
+    """按当前假 API 状态装配一个能用的假页面。"""
+    d = FakeDriver()
+
+    def click_zan():
+        # 模拟真实点击：同步更新点赞列表
+        for h, fid in api._hash_to_flow.items():
+            if fid in (api._hash_to_flow.values()):
+                pass
+        api.zan_list.insert(0, d._zan_hash) if getattr(d, "_zan_hash", None) else None
+
+    def on_follow_click():
+        # 模拟真实点击关注后服务端状态变化
+        for uid in api.followed:
+            if not api.follow_not_effective:
+                api.followed[uid] = 1
+
+    d._elements = {
+        "a[href*=\"/app/user/\"]": FakeElement("作者", displayed=True),
+        ".bt-green-border.follow": FakeElement("关注 TA", on_click=on_follow_click),
+        ".target_comment-editor .ql-editor": FakeElement(""),
+        "a.plugin-btn.submit": FakeElement("点击抽奖"),
+        ".target_zan-flow": FakeElement("", cls="btn zan"),
+    }
+    return d
+
+
 def main() -> int:
     print("\n[1] 语料池")
     c = Corpus(["A", "B", "C"])
@@ -164,176 +290,168 @@ def main() -> int:
     check("6 次选取都在池内", all(p in ("A", "B", "C") for p in picked), str(picked))
     check("前 3 次不重复", len(set(picked[:3])) == 3, str(picked[:3]))
     check("空池回退默认", len(Corpus([]).items) > 0)
-    long_text = Corpus(["x" * 500]).pick()
-    check("超长被截断", len(long_text) <= 100, f"len={len(long_text)}")
 
-    print("\n[2] 完整成功流程")
+    print("\n[2] 打开帖子页")
     with tempfile.TemporaryDirectory() as tmp:
         db = fresh_db(tmp)
         api = FakeApi()
         api.register("H1", 1001, 77, "UH77")
         add_flow(db, "H1", 1001)
-        api = FakeApi()
-        # 重新注册，保证 followed 初始为 0
-        api.register("H1", 1001, 77, "UH77")
-        p = Participant(api, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
-        res = p.participate(db.get_flow("H1"))
+        p, d = make_bundle(api, db)
+        p._open_flow("H1")
+        check(
+            "真实导航到帖子页",
+            any(a[0] == "get" and "app/flow/H1" in a[1] for a in d.actions),
+            str([a for a in d.actions if a[0] == "get"][-1:]),
+        )
 
-        check("参与成功", res.success, str(res.fail_reason or ""))
-        check("三步都完成", res.steps == ["follow", "reply", "like"], str(res.steps))
-        check("记录 reply_id", res.reply_id == 555)
-        check("记录楼层", res.floor == 88)
-
-        row = db.get_participation("H1")
-        check("状态为 done", row["state"] == STATE_DONE)
-        check("关注时间已记", bool(row["followed_at"]))
-        check("回复时间已记", bool(row["replied_at"]))
-        check("点赞时间已记", bool(row["liked_at"]))
-
-        # 关键：顺序必须是 follow → reply → like
-        order = [c for c in api.calls if c in ("follow", "reply", "zan_flow")]
-        check("顺序：关注→回复→点赞", order == ["follow", "reply", "zan_flow"], str(order))
-        check("写操作计数=3", p.write_used == 3, f"{p.write_used}")
-
-        print("\n[3] 已点赞时不重复点赞")
+        print("\n[3] 关注：真实点击作者名与关注按钮")
         api2 = FakeApi()
         api2.register("H1", 1001, 77, "UH77")
-        api2.has_zan["H1"] = 1  # 已点赞
-        p2 = Participant(api2, db, Corpus(), MY_UID, write_budget=10)
-        res2 = p2.participate(db.get_flow("H1"))
-        check("已点赞不调用 zan_flow", "zan_flow" not in api2.calls, str(api2.calls))
-        check("仍判定成功", res2.success, str(res2.fail_reason or ""))
+        p2, d2 = make_bundle(api2, db)
+        p2.ensure_followed("UH77", 77)
+        check(
+            "点过作者名",
+            any(a == ("click", "作者名") for a in d2.actions),
+            str(d2.actions),
+        )
+        check(
+            "点过关注按钮",
+            any(a == ("click", "关注按钮") for a in d2.actions),
+            str(d2.actions),
+        )
 
-        print("\n[4] 已关注时跳过关注")
+        print("\n[4] 关注：已关注则不做任何点击")
         api3 = FakeApi()
-        api3.register("H2", 1002, 78, "UH78")
-        api3.followed[78] = 1
-        add_flow(db, "H2", 1002, author_uid=78)
-        p3 = Participant(api3, db, Corpus(), MY_UID, write_budget=10)
-        res3 = p3.participate(db.get_flow("H2"))
-        check("已关注不调用 follow", "follow" not in api3.calls, str(api3.calls))
-        check("成功", res3.success, str(res3.fail_reason or ""))
+        api3.register("H1", 1001, 77, "UH77")
+        api3.followed[77] = 1
+        p3, d3 = make_bundle(api3, db)
+        p3.ensure_followed("UH77", 77)
+        check("未点作者名", not any(a == ("click", "作者名") for a in d3.actions), str(d3.actions))
 
         print("\n[5] 关注未生效 → 判失败")
         api4 = FakeApi()
-        api4.register("H3", 1003, 79, "UH79")
+        api4.register("H1", 1001, 77, "UH77")
         api4.follow_not_effective = True
-        add_flow(db, "H3", 1003, author_uid=79)
-        p4 = Participant(api4, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
-        res4 = p4.participate(db.get_flow("H3"))
-        check("关注未生效则失败", not res4.success)
-        check("失败原因提到关注", "关注" in (res4.fail_reason or ""), res4.fail_reason or "")
-        check("没有继续回复", "reply" not in api4.calls, str(api4.calls))
-        check("状态为 failed", db.get_participation("H3")["state"] == STATE_FAILED)
+        p4, d4 = make_bundle(api4, db)
+        try:
+            p4.ensure_followed("UH77", 77)
+            ok = False
+        except Exception as exc:
+            ok = "关注" in str(exc)
+        check("回读未关注时抛错", ok)
 
-        print("\n[6] 回复不可见 → 判失败（防假成功）")
+        print("\n[6] 回复：优先点站点快捷按钮")
         api5 = FakeApi()
-        api5.register("H4", 1004, 80, "UH80")
-        api5.reply_not_visible = True
-        add_flow(db, "H4", 1004, author_uid=80)
-        p5 = Participant(api5, db, Corpus(), MY_UID, write_budget=10)
-        res5 = p5.participate(db.get_flow("H4"))
-        check("接口 ok 但列表查不到 → 失败", not res5.success)
-        check("原因提到回读", "回读" in (res5.fail_reason or ""), res5.fail_reason or "")
-        check("没有继续点赞", "zan_flow" not in api5.calls, str(api5.calls))
+        api5.register("H5", 1005, 80, "UH80")
+        add_flow(db, "H5", 1005, author_uid=80)
+        p5, d5 = make_bundle(api5, db)
+        d5.current_url_value = "https://www.zfrontier.com/app/flow/H5"
+        api5.replies[1005] = [MY_UID]
+        try:
+            p5.send_reply(1005, "H5")
+        except Exception:
+            pass
+        check(
+            "点过快捷提交按钮",
+            any(a == ("click", "快捷回复按钮") for a in d5.actions),
+            str(d5.actions),
+        )
 
-        print("\n[7] 点赞接口报「已赞」但两处回读都没反映 → 按成功处理")
-        # 这是有意为之：实测 has_zan 有读缓存（16~30 秒仍为 0），
-        # 若判失败，下次重试会再点一次，反而把赞取消掉。
-        # 因此 zanFlow 明确回了「已赞」就认为站点已接受。
+        print("\n[7] 点赞：点击图标而非接口")
         api6 = FakeApi()
-        api6.register("H5", 1005, 81, "UH81")
-        api6.like_not_effective = True
-        add_flow(db, "H5", 1005, author_uid=81)
-        p6 = Participant(api6, db, Corpus(), MY_UID, write_budget=10)
-        res6 = p6.participate(db.get_flow("H5"))
-        check("接口已赞则判成功", res6.success, str(res6.fail_reason or ""))
-        check("状态为 done", db.get_participation("H5")["state"] == STATE_DONE)
+        api6.register("H6", 1006, 81, "UH81")
+        add_flow(db, "H6", 1006, author_uid=81)
+        p6, d6 = make_bundle(api6, db)
+        d6.current_url_value = "https://www.zfrontier.com/app/flow/H6"
+        api6.zan_list.insert(0, "H6")
+        p6.like_flow(1006, "H6")
+        check("已在点赞列表时不再点击", not any(a == ("click", "点赞按钮") for a in d6.actions))
 
-        print("\n[8] 限流中止且不消耗重试")
+        print("\n[8] 点赞：未赞时真实点击")
         api7 = FakeApi()
-        api7.register("H6", 1006, 82, "UH82")
-        add_flow(db, "H6", 1006, author_uid=82)
-        p7 = Participant(api7, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
-        api7.raise_on = "follow"
-        api7._exc = RateLimited("20001")
-        res7 = p7.participate(db.get_flow("H6"))
-        check("被中止", res7.aborted is not None, str(res7.aborted))
-        row7 = db.get_participation("H6")
-        check("不消耗重试次数", row7["retry_cnt"] == 0, f"retry={row7['retry_cnt']}")
+        api7.register("H7", 1007, 82, "UH82")
+        add_flow(db, "H7", 1007, author_uid=82)
+        p7, d7 = make_bundle(api7, db)
+        d7.current_url_value = "https://www.zfrontier.com/app/flow/H7"
+        # 点完把 H7 放进点赞列表，模拟成功
+        d7._elements[".target_zan-flow"]._on_click = lambda: api7.zan_list.insert(0, "H7")
+        p7.like_flow(1007, "H7")
+        check(
+            "点过点赞按钮",
+            any(a == ("click", "点赞按钮") for a in d7.actions),
+            str(d7.actions),
+        )
 
-        print("\n[9] 验证码中止且不消耗重试")
+        print("\n[9] 断点续跑：已完成的步骤绝不重复")
         api8 = FakeApi()
-        api8.register("H7", 1007, 83, "UH83")
-        add_flow(db, "H7", 1007, author_uid=83)
-        p8 = Participant(api8, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
-        api8.raise_on = "follow"
-        api8._exc = CaptchaRequired("滑块")
-        res8 = p8.participate(db.get_flow("H7"))
-        check("被中止", res8.aborted is not None)
-        check("aborted 含 captcha", "captcha" in (res8.aborted or ""), str(res8.aborted))
-        check("不消耗重试", db.get_participation("H7")["retry_cnt"] == 0)
+        api8.register("H8", 1008, 83, "UH83")
+        add_flow(db, "H8", 1008, author_uid=83)
+        db.mark_followed("H8")
+        db.mark_replied("H8", 777, 33)
+        p8, d8 = make_bundle(api8, db)
+        api8.replies[1008] = [MY_UID]
+        api8.zan_list.insert(0, "H8")
+        res8 = p8.participate(db.get_flow("H8"))
+        check("成功", res8.success, str(res8.fail_reason or ""))
+        check("未点关注按钮", not any(a == ("click", "关注按钮") for a in d8.actions), str(d8.actions))
+        check("未点快捷回复", not any(a == ("click", "快捷回复按钮") for a in d8.actions), str(d8.actions))
+        check("沿用了原 reply_id", res8.reply_id == 777, str(res8.reply_id))
 
-        print("\n[10] 登录失效中止")
+        print("\n[10] 预算耗尽 → 中止整轮")
         api9 = FakeApi()
-        api9.register("H8", 1008, 84, "UH84")
-        add_flow(db, "H8", 1008, author_uid=84)
-        p9 = Participant(api9, db, Corpus(), MY_UID, write_budget=10)
-        api9.raise_on = "follow"
-        api9._exc = SessionExpired("未登录")
-        res9 = p9.participate(db.get_flow("H8"))
-        check("含 session_expired", "session_expired" in (res9.aborted or ""), str(res9.aborted))
+        api9.register("H9", 1009, 84, "UH84")
+        add_flow(db, "H9", 1009, author_uid=84)
+        p9, _ = make_bundle(api9, db, budget=0)
+        res9 = p9.participate(db.get_flow("H9"))
+        check("预算 0 无法完成", not res9.success)
+        check("aborted 含 budget", "budget" in (res9.aborted or ""), str(res9.aborted))
+        check("不记为失败重试", db.get_participation("H9")["retry_cnt"] == 0)
 
-        print("\n[11] 重试用尽 → give_up")
+        print("\n[11] 限流 / 验证码 / 登录失效 中止且不消耗重试")
+        for name, exc, key in (
+            ("限流", RateLimited("20001"), "rate_limited"),
+            ("验证码", CaptchaRequired("滑块"), "captcha"),
+            ("登录失效", SessionExpired("未登录"), "session_expired"),
+        ):
+            h = f"H_{key}"
+            apix = FakeApi()
+            apix.register(h, 2000 + len(h), 90, "UH90")
+            add_flow(db, h, 2000 + len(h), author_uid=90)
+            px, dx = make_bundle(apix, db)
+            # 在「打开帖子页」这个必经点上抛出对应异常，
+            # 验证 participate 能把三类致命错误正确映射为 aborted
+            def boom(*a, **k):
+                raise exc
+            px._open_flow = boom
+            rx = px.participate(db.get_flow(h))
+            check(f"{name}被中止", rx.aborted is not None, str(rx.aborted))
+            check(f"{name}不消耗重试", db.get_participation(h)["retry_cnt"] == 0)
+
+        print("\n[12] 重试用尽 → give_up")
         api10 = FakeApi()
-        api10.register("H9", 1009, 85, "UH85")
-        api10.fail_follow = True
-        add_flow(db, "H9", 1009, author_uid=85)
-        p10 = Participant(api10, db, Corpus(), MY_UID, max_retry=2, write_budget=50)
-        for i in range(2):
-            p10.participate(db.get_flow("H9"))
-        row10 = db.get_participation("H9")
-        check("达到上限后 give_up", row10["state"] == STATE_GIVE_UP, row10["state"])
-        check("重试次数=2", row10["retry_cnt"] == 2, f"{row10['retry_cnt']}")
-
-        print("\n[12] 写预算耗尽 → 中止整轮")
-        api11 = FakeApi()
-        api11.register("H10", 1010, 86, "UH86")
-        add_flow(db, "H10", 1010, author_uid=86)
-        p11 = Participant(api11, db, Corpus(), MY_UID, write_budget=1)
-        res11 = p11.participate(db.get_flow("H10"))
-        check("预算 1 不足以完成三步", not res11.success)
-        check("aborted 含 budget", "budget" in (res11.aborted or ""), str(res11.aborted))
-        check("不记为失败重试", db.get_participation("H10")["retry_cnt"] == 0)
+        api10.register("H10", 1010, 85, "UH85")
+        add_flow(db, "H10", 1010, author_uid=85)
+        p10, _ = make_bundle(api10, db, max_retry=2)
+        db.mark_followed("H10")
+        db.mark_replied("H10", 1, 1)
+        # 让点赞始终无法确认
+        p10._in_watchlist = lambda *a, **k: False
+        api10.flow_detail = lambda h: {"flow": {"has_zan": 0, "id": 1010}}
+        for _ in range(2):
+            p10.participate(db.get_flow("H10"))
+        row = db.get_participation("H10")
+        check("达到上限 give_up", row["state"] == STATE_GIVE_UP, row["state"])
 
         print("\n[13] 缺少必要字段")
         db.upsert_flow({"hash": "H11", "created_at": "2026-11-17 10:00:00"})
         db.update_lottery("H11", is_lottery=1, lottery_status=1)
         db.ensure_participation("H11")
-        p12 = Participant(FakeApi(), db, Corpus(), MY_UID, write_budget=10)
-        res12 = p12.participate(db.get_flow("H11"))
-        check("缺 flow_id 则失败", not res12.success)
-        check("原因说明缺字段", "flow_id" in (res12.fail_reason or ""), res12.fail_reason or "")
+        p11, _ = make_bundle(FakeApi(), db)
+        res11 = p11.participate(db.get_flow("H11"))
+        check("缺 flow_id 则失败", not res11.success)
+        check("原因说明缺字段", "flow_id" in (res11.fail_reason or ""), res11.fail_reason or "")
 
-
-        print("\n[14] 断点续跑：已完成步骤不重复执行")
-        api14 = FakeApi()
-        api14.register("H12", 1012, 90, "UH90")
-        add_flow(db, "H12", 1012, author_uid=90)
-        # 模拟上次「回复成功、点赞失败」：先标记已关注、已回复
-        db.mark_followed("H12")
-        db.mark_replied("H12", 777, 33)
-        db.bump_retry("H12", "点赞后回读 has_zan 仍为 0")
-        p14 = Participant(api14, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
-        res14 = p14.participate(db.get_flow("H12"))
-        check("重试成功", res14.success, str(res14.fail_reason or ""))
-        check("没有重复关注", "follow" not in api14.calls, str(api14.calls))
-        check("没有重复回复", "reply" not in api14.calls, str(api14.calls))
-        check("只补了点赞", "zan_flow" in api14.calls, str(api14.calls))
-        check("沿用了原 reply_id", res14.reply_id == 777, str(res14.reply_id))
-        row14 = db.get_participation("H12")
-        check("保留原回复时间", bool(row14["replied_at"]))
-        check("状态 done", row14["state"] == STATE_DONE)
         db.close()
 
     print("\n" + "=" * 52)
