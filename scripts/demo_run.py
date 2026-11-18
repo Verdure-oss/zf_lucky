@@ -60,9 +60,15 @@ def main() -> int:
     ap.add_argument("--no-like", action="store_true", help="不点赞")
     ap.add_argument("--no-follow", action="store_true", help="不关注")
     ap.add_argument("--no-reply", action="store_true", help="不回复（只看页面）")
+    ap.add_argument("--slow", type=int, default=1, help="停顿倍数，默认 1；给 3 会慢很多")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    K = max(1, args.slow)
+
+    def nap(sec):
+        """按倍数放大停顿，便于肉眼观察每一步。"""
+        time.sleep(sec * K)
     cfg = cfg_mod.load()
 
     if not wait_selenium_ready(cfg.selenium_url, timeout=60):
@@ -103,46 +109,46 @@ def main() -> int:
             my_uid=user.get("userId") or 0,
             max_retry=1,
             write_budget=10,
-            delay_min=2,
-            delay_max=4,
+            delay_min=2 * K,
+            delay_max=4 * K,
         )
 
         # 1) 打开帖子页
         print("\n========== 步骤 1/3：打开帖子页 ==========")
         p._open_flow(args.hash)
         print(">>> 页面已就绪，请看 noVNC 画面")
-        time.sleep(4)
+        nap(4)
 
         # 2) 关注
         if not args.no_follow:
             print("\n========== 步骤 2/3：关注作者 ==========")
-            print(">>> 即将点击作者名 → 进主页 → 点关注")
-            time.sleep(3)
+            print(">>> 即将点击作者名 → 进主页 → 点关注（请看画面）")
+            nap(3)
             try:
                 p.ensure_followed(author_hash, int(author_uid or 0))
                 print(">>> 关注完成")
             except Exception as exc:
                 print(f">>> 关注失败：{exc}")
             p._open_flow(args.hash)
-            time.sleep(3)
+            nap(3)
 
         # 3) 回复
         if not args.no_reply:
             print("\n========== 步骤 3/3：发送回复 ==========")
-            print(">>> 即将点击输入框 → 打字 → 点发送")
-            time.sleep(3)
+            print(">>> 即将点击输入框 → 打字 → 点发送（请看画面）")
+            nap(3)
             try:
                 info = p.send_reply(fid, args.hash)
                 print(f">>> 回复成功：floor={info.get('floor')} 内容={info.get('content')!r}")
             except Exception as exc:
                 print(f">>> 回复失败：{exc}")
-            time.sleep(3)
+            nap(3)
 
         # 4) 点赞
         if not args.no_like:
             print("\n========== 附加：点赞 ==========")
-            print(">>> 即将点击点赞图标")
-            time.sleep(3)
+            print(">>> 即将点击点赞图标（请看画面）")
+            nap(3)
             try:
                 p.like_flow(fid, args.hash)
                 print(">>> 点赞完成")
@@ -150,7 +156,7 @@ def main() -> int:
                 print(f">>> 点赞失败：{exc}")
 
         print("\n>>> 演示结束，浏览器保持打开 20 秒供观察")
-        time.sleep(20)
+        nap(10)
         return 0
     finally:
         d.quit()
