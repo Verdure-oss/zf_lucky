@@ -51,10 +51,15 @@ class RunSummary:
     failed: int = 0
     note: str = ""
     errors: List[Dict[str, str]] = field(default_factory=list)
+    draw: Dict[str, Any] = field(default_factory=dict)
 
     def to_note(self) -> str:
         parts = [f"扫描{self.scanned}", f"判定{self.detail_checked}",
                  f"参与{self.participated}", f"失败{self.failed}"]
+        if self.draw and self.draw.get("checked"):
+            parts.append(
+                f"开奖{self.draw.get('won', 0)}中/{self.draw.get('lost', 0)}未"
+            )
         text = " ".join(parts)
         if self.note:
             text += f" | {self.note}"
@@ -248,6 +253,32 @@ class Runner:
             abort = self._participate(session, summary)
             if abort:
                 summary.result = self._result_from_abort(abort)
+
+            # 5b. 检测已参与帖子的开奖结果（中奖/未中奖）
+            try:
+                from .zf.draw import check_finished_flows
+
+                draw_stats = check_finished_flows(
+                    self.db,
+                    Api(
+                        self.driver,
+                        delay_min=self.cfg.request_delay_min,
+                        delay_max=self.cfg.request_delay_max,
+                    ),
+                    my_uid=session.uid or 0,
+                )
+                summary.draw = draw_stats
+                log.info(
+                    "开奖检测：查 %d，中奖 %d，未中奖 %d，未开奖 %d",
+                    draw_stats.get("checked", 0),
+                    draw_stats.get("won", 0),
+                    draw_stats.get("lost", 0),
+                    draw_stats.get("pending", 0),
+                )
+                for w in draw_stats.get("won_list") or []:
+                    log.info("🎉 中奖啦！%s | %s", w.get("title"), w.get("prize"))
+            except Exception as exc:
+                log.warning("开奖结果检测失败（不影响本轮）：%s", exc)
 
             # 6. 更新水位（只在正常走完时更新，避免中止时缩小覆盖范围）
             if summary.result == RESULT_SUCCESS and flows:

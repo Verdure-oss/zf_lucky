@@ -244,6 +244,12 @@ def build_view() -> Dict[str, Any]:
     # 用锁文件是否被持有来交叉验证，避免面板长期误显示「运行中」。
     last_running = last.get("result") == "running" and _runner_alive()
 
+    # 中奖统计
+    try:
+        outcome_stats = db.outcome_stats()
+    except Exception:
+        outcome_stats = {"won": 0, "lost": 0, "awaiting": 0}
+
     # 帖子列表
     rows = db.list_for_panel(limit=300)
     items: List[Dict[str, Any]] = []
@@ -269,6 +275,19 @@ def build_view() -> Dict[str, Any]:
         status = r.get("lottery_status")
         expired = status is not None and status != 1
 
+        # 开奖结果：won / lost / None（未检测）
+        outcome = r.get("outcome")
+        if outcome == "won":
+            state_label, state_cls = "🎉 中奖", "won"
+        elif outcome == "lost":
+            state_label, state_cls = "未中奖", "muted2"
+        elif state == "done":
+            state_label, state_cls = ("已参与·待开奖" if not expired else "已参与"), cls
+        elif expired and state != "done":
+            state_label, state_cls = "已开奖", "muted"
+        else:
+            state_label, state_cls = label, cls
+
         items.append(
             {
                 "hash": r.get("hash"),
@@ -278,8 +297,10 @@ def build_view() -> Dict[str, Any]:
                 "lottery_at": _fmt_time(r.get("lottery_at")),
                 "prizes": prize_text,
                 "state": state,
-                "state_label": "已开奖" if expired and state != "done" else label,
-                "state_cls": "muted" if expired and state != "done" else cls,
+                "outcome": outcome,
+                "prize_won": r.get("prize") or "",
+                "state_label": state_label,
+                "state_cls": state_cls,
                 "state_note": r.get("fail_reason") or "",
                 "retry": r.get("retry_cnt") or 0,
                 "needs_follow": bool(r.get("needs_follow")),
@@ -314,6 +335,7 @@ def build_view() -> Dict[str, Any]:
         "now": now.strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
         "counts": counts,
+        "outcome": outcome_stats,
         "total": len(items),
         "last": last,
         "last_running": last_running,
@@ -706,6 +728,9 @@ PAGE = r"""
   .pill.err{background:rgba(248,81,73,.15);color:var(--err)}
   .pill.info{background:rgba(88,166,255,.15);color:var(--info)}
   .pill.muted{background:rgba(139,147,161,.15);color:var(--muted)}
+  .pill.won{background:rgba(255,196,0,.18);color:#e0a800;font-weight:700}
+  .pill.muted2{background:rgba(139,147,161,.12);color:var(--muted)}
+  tr.row-won td{background:rgba(255,196,0,.07)}
   .tag{font-size:10px;color:var(--muted);border:1px solid var(--line);
        padding:0 5px;border-radius:4px;margin-left:4px}
   .empty{padding:44px;text-align:center;color:var(--muted)}
@@ -749,6 +774,9 @@ PAGE = r"""
   {% endif %}
 
   <div class="bar">
+    <div class="stat"><b style="color:var(--win)">{{ v.outcome['won'] }}</b><span>中奖</span></div>
+    <div class="stat"><b>{{ v.outcome['lost'] }}</b><span>未中奖</span></div>
+    <div class="stat"><b>{{ v.outcome['awaiting'] }}</b><span>待开奖</span></div>
     <div class="stat"><b>{{ v.counts['done'] }}</b><span>已完成</span></div>
     <div class="stat"><b>{{ v.counts['pending'] }}</b><span>待执行</span></div>
     <div class="stat"><b>{{ v.counts['failed'] }}</b><span>失败</span></div>
@@ -851,7 +879,7 @@ PAGE = r"""
     </thead>
     <tbody>
     {% for it in v['items'] %}
-      <tr>
+      <tr class="{{ 'row-won' if it.outcome == 'won' else '' }}">
         <td>
           <a class="t" href="https://www.zfrontier.com/app/flow/{{ it.hash }}"
              target="_blank" rel="noopener"
@@ -867,6 +895,9 @@ PAGE = r"""
         <td class="hide-sm">{{ it.prizes }}</td>
         <td>
           <span class="pill {{ it.state_cls }}">{{ it.state_label }}</span>
+          {% if it.outcome == 'won' and it.prize_won %}
+          <div class="prize-won">🏆 {{ it.prize_won }}</div>
+          {% endif %}
           {% if it.state_note %}<div class="reason">{{ it.state_note[:80] }}</div>{% endif %}
         </td>
         <td class="hide-sm note">
@@ -1005,7 +1036,7 @@ LOGS_PAGE = r"""
         --ok:#3fb950;--warn:#d29922;--err:#f85149;--info:#58a6ff;--accent:#02c39a}
   @media (prefers-color-scheme:light){
     :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6eb;--fg:#1f2328;--muted:#6e7781;
-          --ok:#1a7f37;--warn:#9a6700;--err:#cf222e;--info:#0969da;--accent:#0b8f74}}
+          --ok:#1a7f37;--warn:#9a6700;--err:#cf222e;--info:#0969da;--accent:#0b8f74;--win:#b8860b}}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif}

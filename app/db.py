@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS participations (
     retry_cnt    INTEGER NOT NULL DEFAULT 0,
     fail_reason  TEXT,
     updated_at   TEXT,
+    -- 开奖结果：NULL=未检测 won=中奖 lost=未中奖
+    outcome      TEXT,
+    prize        TEXT,
+    winners      TEXT,   -- JSON：中奖者列表
+    checked_at   TEXT,   -- 最近一次检测开奖结果的时间
     FOREIGN KEY (hash) REFERENCES flows(hash)
 );
 
@@ -134,10 +139,59 @@ class Database:
                 conn.execute("PRAGMA busy_timeout=10000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.executescript(SCHEMA)
+                self._migrate(conn)
                 conn.commit()
                 self._conns[tid] = conn
                 log.debug("线程 %s 建立数据库连接", tid)
         return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """
+        轻量迁移：给已存在的表补新列。
+
+        CREATE TABLE IF NOT EXISTS 只对**新建**的表生效，
+        对已存在的表不会加列。本项目随功能演进会新增字段
+        （如开奖结果 outcome/prize/winners/checked_at），
+        因此必须显式 ALTER TABLE 补齐，否则老库启动即报
+        「no such column: outcome」。
+
+        做法：查 PRAGMA table_info，缺哪列补哪列，幂等安全。
+        """
+        wanted = {
+            "participations": [
+                ("outcome", "TEXT"),
+                ("prize", "TEXT"),
+                ("winners", "TEXT"),
+                ("checked_at", "TEXT"),
+            ],
+        }
+        for table, columns in wanted.items():
+            try:
+                existing = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+            except sqlite3.Error:
+                continue
+            if not existing:
+                continue  # 表不存在，SCHEMA 会创建
+            for name, decl in columns:
+                if name in existing:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    log.info("数据库迁移：%s 新增列 %s", table, name)
+                except sqlite3.Error as exc:
+                    log.warning("迁移 %s.%s 失败：%s", table, name, exc)
+
+        # 依赖新列的索引必须在补列之后创建
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_part_outcome "
+                "ON participations(outcome)"
+            )
+        except sqlite3.Error as exc:
+            log.warning("创建 outcome 索引失败：%s", exc)
 
     def close(self) -> None:
         """关闭当前线程的连接。"""
@@ -543,6 +597,77 @@ class Database:
 
     # ---------- 面板查询 ----------
 
+    # ---------- 开奖结果 ----------
+
+    def flows_awaiting_result(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """
+        待检测开奖结果的帖子。
+
+        条件：已参与完成，且尚未记录开奖结果。
+        没参与的帖子不必检测——中奖与否与我无关。
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT f.hash, f.title, f.lottery_status, f.lottery_at
+                FROM flows f
+                JOIN participations p ON f.hash = p.hash
+                WHERE p.state = 'done'
+                  AND p.outcome IS NULL
+                ORDER BY f.lottery_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def set_outcome(
+        self,
+        hash_: str,
+        outcome: str,
+        prize: Optional[str] = None,
+        winners: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """记录开奖结果。"""
+        import json as _json
+
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE participations
+                SET outcome = ?, prize = ?, winners = ?, checked_at = ?, updated_at = ?
+                WHERE hash = ?
+                """,
+                (
+                    outcome,
+                    prize,
+                    _json.dumps(winners or [], ensure_ascii=False),
+                    now_str(),
+                    now_str(),
+                    hash_,
+                ),
+            )
+
+    def outcome_stats(self) -> Dict[str, int]:
+        """中奖统计，供面板展示。"""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN outcome = 'won'  THEN 1 ELSE 0 END) AS won,
+                    SUM(CASE WHEN outcome = 'lost' THEN 1 ELSE 0 END) AS lost,
+                    SUM(CASE WHEN outcome IS NULL AND state = 'done' THEN 1 ELSE 0 END)
+                        AS awaiting
+                FROM participations
+                """
+            )
+            row = cur.fetchone()
+            return {
+                "won": int(row["won"] or 0),
+                "lost": int(row["lost"] or 0),
+                "awaiting": int(row["awaiting"] or 0),
+            }
+
     def list_for_panel(self, limit: int = 200) -> List[Dict[str, Any]]:
         """面板用的联表视图。"""
         with self._cursor() as cur:
@@ -552,7 +677,8 @@ class Database:
                        f.is_lottery, f.lottery_status, f.lottery_at,
                        f.prizes, f.needs_follow,
                        p.state, p.retry_cnt, p.fail_reason,
-                       p.followed_at, p.replied_at, p.liked_at, p.updated_at
+                       p.followed_at, p.replied_at, p.liked_at, p.updated_at,
+                       p.outcome, p.prize, p.winners, p.checked_at
                 FROM flows f
                 LEFT JOIN participations p ON f.hash = p.hash
                 WHERE f.is_lottery = 1
