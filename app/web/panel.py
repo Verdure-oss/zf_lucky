@@ -823,7 +823,12 @@ PAGE = r"""
     {% if v.session.live %}
       ｜ 已登录 <b>{{ v.session.nickname }}</b>（uid {{ v.session.uid }}）
     {% endif %}
+    {% if v['vnc'].running %}
     ｜ <a href="#" onclick="openVnc(event)" style="color:var(--accent)">观看浏览器 ↗</a>
+    ｜ <a href="#" onclick="vncToggle(false)" style="color:var(--muted);font-size:12px">关闭观看</a>
+    {% else %}
+    ｜ <a href="#" onclick="openVnc(event)" style="color:var(--accent)">观看浏览器 ↗</a>
+    {% endif %}
     ｜ <a href="/logs" target="_blank" rel="noopener"
           style="color:var(--accent)">实时日志 ↗</a>
   </div>
@@ -859,7 +864,11 @@ PAGE = r"""
       <span>运行状态</span>
     </div>
 
+    {% if v['vnc'].running %}
+    <button onclick="vncToggle(false)">关闭观看</button>
+    {% else %}
     <button onclick="openVnc(event)">观看浏览器</button>
+    {% endif %}
     <a href="/logs" target="_blank" rel="noopener" style="text-decoration:none"><button>日志</button></a>
     <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>立即运行</button>
     <button onclick="togglePause()">{% if v.paused %}恢复{% else %}暂停{% endif %}</button>
@@ -898,6 +907,7 @@ PAGE = r"""
     <div class="grow"></div>
     {% if v['login'].running %}
       <button class="primary" onclick="openVnc(event)">打开浏览器画面</button>
+      <button onclick="vncToggle(false)">关闭观看</button>
       <button onclick="loginFinish()">我登录好了</button>
       <button onclick="loginCancel()">取消</button>
     {% else %}
