@@ -932,7 +932,8 @@ PAGE = r"""
   {# ---------------- 历史战绩 ---------------- #}
   <div class="history" id="hist">
     <h3 onclick="toggleHist()" style="cursor:pointer;user-select:none">历史战绩 <span id="histArrow" style="opacity:.6">▾</span></h3>
-    <div class="hgrid" id="histBody">
+    <div id="histBody">
+    <div class="hgrid">
       <div class="hitem"><b>{{ v.history['total'] }}</b><span>累计参与</span></div>
       <div class="hitem"><b style="color:var(--win)">{{ v.history['won'] }}</b><span>中奖次数</span></div>
       <div class="hitem"><b>{{ v.history['lost'] }}</b><span>未中奖</span></div>
@@ -974,6 +975,7 @@ PAGE = r"""
       {% endfor %}
     </div>
     {% endif %}
+    </div><!-- /histBody -->
   </div>
 
 
@@ -1087,6 +1089,45 @@ function doRun(){
     toast(d.msg || (d.ok ? '已提交' : '失败'));
     if (d.ok) setTimeout(function(){ location.reload(); }, 1800);
   }).catch(function(e){ toast('请求失败：' + e); });
+}
+
+/* ---------------- 分区筛选 ---------------- */
+var curFilter = 'all';
+
+function setFilter(f, el){
+  curFilter = f;
+  var chips = document.querySelectorAll('.chip');
+  for (var i = 0; i < chips.length; i++) { chips[i].classList.remove('on'); }
+  if (el) { el.classList.add('on'); }
+  applyFilter();
+}
+
+function applyFilter(){
+  var q = ((document.getElementById('q') || {}).value || '').trim().toLowerCase();
+  var rows = document.querySelectorAll('#tbl tbody tr');
+  var shown = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var tr = rows[i];
+    var f = tr.getAttribute('data-filter');
+    var text = (tr.getAttribute('data-q') || '').toLowerCase();
+    var okF = (curFilter === 'all') || (f === curFilter);
+    var okQ = !q || text.indexOf(q) >= 0;
+    var show = okF && okQ;
+    tr.style.display = show ? '' : 'none';
+    if (show) shown++;
+  }
+  var empty = document.getElementById('noresult');
+  if (empty) { empty.style.display = shown ? 'none' : 'block'; }
+}
+
+/* 历史战绩折叠 */
+function toggleHist(){
+  var b = document.getElementById('histBody');
+  var a = document.getElementById('histArrow');
+  if (!b) return;
+  var hidden = (b.style.display === 'none');
+  b.style.display = hidden ? '' : 'none';
+  a.textContent = hidden ? '▾' : '▸';
 }
 function togglePause(){
   var paused = {{ 'true' if v.paused else 'false' }};
