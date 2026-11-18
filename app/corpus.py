@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 # ---------- 通用语（与内容无关时的兜底）----------
 
 DEFAULT_CORPUS = [
+    # 常见的抽奖参与语（参考站内真实回复风格）
     "冲冲冲",
     "来了来了",
     "参与一下",
@@ -47,6 +48,22 @@ DEFAULT_CORPUS = [
     "试试运气",
     "想要一份",
     "安排上",
+    "支持一波",
+    "那必须是我了",
+    "凑个热闹",
+    "来晚了没",
+    "中不中无所谓，参与一下",
+    "求个好运",
+    "这个真想要",
+    "蹲蹲蹲",
+    "来一份",
+    "碰碰运气",
+    "希望能轮到我",
+    "留个名",
+    "凑个数",
+    "想要想要",
+    "看起来很香",
+    "心动",
 ]
 
 # ---------- 品类关键词：命中后用于生成相关评论 ----------
@@ -64,6 +81,11 @@ CATEGORIES: List[Dict] = [
             "轴体有兴趣，参与一下",
             "{item}这价位可以",
             "段落手感听着不错，蹲",
+                    "想试试这个轴，蹲",
+            "手感听着不错，来一份",
+            "这个轴可以，参与",
+            "轴体爱好者路过，抽一个",
+            "段落感挺期待",
         ],
     },
     {
@@ -76,6 +98,11 @@ CATEGORIES: List[Dict] = [
             "键帽质感可以，支持一下",
             "{item}挺对味，冲",
             "这套想收，蹲一个",
+                    "这套配色挺戳我，蹲",
+            "键帽党报到，抽一个",
+            "字符设计不错，参与",
+            "想收一套，支持",
+            "这个主题有意思",
         ],
     },
     {
@@ -87,6 +114,10 @@ CATEGORIES: List[Dict] = [
             "{item}尺寸挺合适，抽一份",
             "桌垫想换一个，支持",
             "{item}铺桌面挺搭",
+                    "桌面正好缺个垫，蹲",
+            "这个图案可以，参与",
+            "桌垫党来了，抽一个",
+            "想要大尺寸的",
         ],
     },
     {
@@ -98,6 +129,10 @@ CATEGORIES: List[Dict] = [
             "{item}想组一把，抽一个",
             "配列挺对味，支持一下",
             "{item}外壳看着不错",
+                    "想组一把，蹲",
+            "这个配列可以，参与",
+            "套件党报到，抽一个",
+            "工艺看着不错",
         ],
     },
     {
@@ -108,6 +143,9 @@ CATEGORIES: List[Dict] = [
             "这把键盘想上手试试，参与",
             "{item}配置可以，抽一个",
             "成品省心，蹲一个",
+                    "开箱就用的省心，蹲",
+            "这把可以，参与",
+            "想入手一台",
         ],
     },
     {
@@ -117,6 +155,9 @@ CATEGORIES: List[Dict] = [
             "{item}配色挺搭，蹲一个",
             "这根线想换，参与",
             "线材质感可以，支持",
+                    "想换根线，蹲",
+            "配色不错，参与",
+            "线材党报到",
         ],
     },
 ]
@@ -227,9 +268,16 @@ def extract_item(title: str, text: str = "") -> Optional[Dict]:
             for w in best["words"]:
                 idx = part.lower().find(w.lower())
                 if idx >= 0:
-                    # 以关键词为中心，向左扩 6 字、向右扩 3 字
-                    s = max(0, idx - 5)
-                    frag = part[s: idx + len(w) + 3].strip(" .+-—")
+                    # 优先用整段；过长才以关键词为中心截取，
+                    # 且不截断中文词首（避免「人工智能」变成「工智能」）
+                    if len(part) <= 14:
+                        frag = part
+                    else:
+                        s = max(0, idx - 6)
+                        # 若左边界落在中文词中间，向前找到分隔或开头
+                        if s > 0 and ord(part[s]) > 127 and ord(part[s - 1]) > 127:
+                            s = 0
+                        frag = part[s: idx + len(w) + 4].strip(" .+-—")
                     # 去掉可能夹带的英文人名前缀
                     frag = re.sub(r"^[A-Za-z'’ ]{2,}\s+", "", frag).strip()
                     if _looks_like_item(frag):
@@ -240,6 +288,15 @@ def extract_item(title: str, text: str = "") -> Optional[Dict]:
 
     if not item:
         item = CATEGORY_NOUNS.get(best["name"], best["name"])
+    else:
+        # 最后一道保险：item 若不含任何品类关键词且明显偏短，
+        # 多半是品牌/人名（羽树、捕获者），改用品类代称更自然
+        cat_words2 = [w.lower() for w in best["words"]]
+        if len(item) <= 5 and not any(w in item.lower() for w in cat_words2):
+            item = CATEGORY_NOUNS.get(best["name"], best["name"])
+        # 过长的片段读起来像标题而非产品名，也换成品类代称
+        if len(item) > 10:
+            item = CATEGORY_NOUNS.get(best["name"], best["name"])
 
     return {"category": best["name"], "item": item}
 
