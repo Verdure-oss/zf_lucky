@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -162,6 +163,10 @@ class Participant:
 
         必须先查 has_zan：已点赞的再点会变成取消赞，
         反而把「已参与」标记抹掉。
+
+        ⚠️ 回读要留足时间：详情接口有缓存，点赞成功后立刻查可能仍是 0。
+        实测多条帖子出现「点赞成功但回读为 0」，事后复查 has_zan 已是 1。
+        原实现只等约 7 秒（1.5+2.5+3.5），不够；改为递增等待、总计约 30 秒。
         """
         info = self.api.flow_detail(self._current_hash)
         flow = info.get("flow") or {}
@@ -173,16 +178,29 @@ class Participant:
         self.api.zan_flow(flow_id)
         log.info("  已发送点赞请求")
 
-        for attempt in range(3):
+        # 递增等待：2, 4, 6, 8, 10 秒，累计约 30 秒
+        for attempt, wait in enumerate((2, 4, 6, 8, 10), start=1):
+            time.sleep(wait)
             info = self.api.flow_detail(self._current_hash)
             flow = info.get("flow") or {}
             if int(flow.get("has_zan") or 0) == 1:
-                log.info("  点赞已确认")
+                log.info("  点赞已确认（第 %d 次回读）", attempt)
                 return
-            import time
 
-            time.sleep(1.5 + attempt)
-        raise StepError("点赞后回读 has_zan 仍为 0")
+        # 最后再刷新一次页面后复查，排除页面级缓存
+        try:
+            self.api.driver.get(
+                f"https://www.zfrontier.com/app/flow/{self._current_hash}"
+            )
+            info = self.api.flow_detail(self._current_hash)
+            flow = info.get("flow") or {}
+            if int(flow.get("has_zan") or 0) == 1:
+                log.info("  点赞已确认（刷新页面后复查）")
+                return
+        except Exception as exc:
+            log.debug("刷新复查失败：%s", exc)
+
+        raise StepError("点赞后回读 has_zan 仍为 0（已等待约 30 秒）")
 
     # ---------- 预算 ----------
 

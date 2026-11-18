@@ -159,13 +159,38 @@ def compute_stop_boundary(
     return max(hard, soft)
 
 
+def should_stop_by_seen(
+    items: List["ScannedFlow"],
+    known: set,
+    confirm_count: int = 5,
+) -> bool:
+    """
+    按「连续已入库」判断是否可以停止滚动。
+
+    这是用户提出的优化思路：情报专栏近似按时间倒序，所以一旦连续遇到
+    若干条**数据库里已有**的帖子，说明已经翻到上次处理过的区域，
+    后面不会有新内容了。比固定按「多少天前」判断更贴合实际，
+    也不会因为抽奖周期长而多翻几十条。
+
+    为什么仍保留 confirm_count（默认 5）而不是遇到 1 条就停：
+    实测列表存在局部倒挂（最多 12.3 小时），单条命中可能是夹在中间的老帖，
+    连续 5 条都命中才能确信已进入历史区域。
+    """
+    if not items or confirm_count <= 0:
+        return False
+    if len(items) < confirm_count:
+        return False
+    tail = items[-confirm_count:]
+    return all(i.hash in known for i in tail)
+
+
 def should_stop(
     items: List[ScannedFlow],
     boundary: datetime,
     confirm_count: int,
 ) -> bool:
     """
-    是否已可停止滚动。
+    按「时间边界」判断是否可以停止（兜底用）。
 
     判据：列表从新到旧排列，因此从**末尾**往前数，
     连续 confirm_count 条都早于 boundary 才停。
@@ -173,6 +198,9 @@ def should_stop(
     用「连续」而非「出现过」，是为了抵抗局部倒挂；
     用 confirm_count 而非 1，是因为实测倒挂最多影响 2 条，
     取 10 留了 5 倍裕量。
+
+    它与 should_stop_by_seen 是「或」的关系：
+    任一满足即可停——已入库判断更快，时间边界防止数据库为空时无限翻。
     """
     if not items:
         return False
@@ -200,12 +228,15 @@ class Scanner:
         confirm_count: int = 10,
         max_scroll: int = 15,
         max_items: int = 500,
+        seen_confirm: int = 5,
     ):
         self.driver = driver
         self.tag_id = tag_id
         self.confirm_count = confirm_count
         self.max_scroll = max_scroll
         self.max_items = max_items
+        # 连续多少条已入库即停止（用户提出的高效判据）
+        self.seen_confirm = seen_confirm
 
     def _grab(self) -> Dict[str, Any]:
         result = self.driver.js_async(_GRAB_JS, timeout=30)
@@ -242,11 +273,13 @@ class Scanner:
             time.sleep(0.8)
         return False
 
-    def scan(self, boundary: datetime) -> List[ScannedFlow]:
+    def scan(self, boundary: datetime, known: Optional[set] = None) -> List[ScannedFlow]:
         """
         扫描情报专栏，返回去重后的帖子列表（新→旧）。
 
-        :param boundary: 停止边界，连续 confirm_count 条早于它即停
+        :param boundary: 时间兜底边界，连续 confirm_count 条早于它即停
+        :param known: 已知（已入库）的 hash 集合。连续 seen_confirm 条都命中
+                      则提前停止——比按天数判断更省，详见 should_stop_by_seen
         """
         url = TAG_URL.format(tag_id=self.tag_id)
         log.info("打开情报专栏：%s（边界 %s）", url, boundary.strftime("%Y-%m-%d %H:%M"))
@@ -260,6 +293,9 @@ class Scanner:
         first = self._grab()
         if not first.get("ok"):
             raise RuntimeError(f"读取列表失败：{first.get('reason')}")
+
+        known = known or set()
+        seen_hits = 0
 
         seen: Dict[str, ScannedFlow] = {}
         order: List[ScannedFlow] = []
@@ -289,10 +325,16 @@ class Scanner:
                 order[-1].created_at.strftime("%m-%d %H:%M") if order else "-",
             )
 
-            # 已拿到足够多且末尾连续够久早于边界 → 完成
+            # 停止判断：已入库优先，时间边界兜底
+            if should_stop_by_seen(order, known, self.seen_confirm):
+                log.info(
+                    "末尾连续 %d 条均已入库，判定已到历史区域，停止",
+                    self.seen_confirm,
+                )
+                break
             if should_stop(order, boundary, self.confirm_count):
                 log.info(
-                    "满足停止条件：末尾连续 %d 条早于 %s",
+                    "满足时间边界停止：末尾连续 %d 条早于 %s",
                     self.confirm_count,
                     boundary.strftime("%Y-%m-%d %H:%M"),
                 )

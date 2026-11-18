@@ -64,6 +64,8 @@ class Config:
     scan_window_days: int = 14
     scan_buffer_days: int = 2
     scan_confirm_count: int = 10
+    scan_seen_confirm: int = 5
+    judge_max_per_run: int = 40
     scan_max_scroll: int = 15
     scan_max_items: int = 500
 
@@ -155,6 +157,8 @@ def load() -> Config:
         scan_window_days=_int("SCAN_WINDOW_DAYS", 14),
         scan_buffer_days=_int("SCAN_BUFFER_DAYS", 2),
         scan_confirm_count=_int("SCAN_CONFIRM_COUNT", 10),
+        scan_seen_confirm=_int("SCAN_SEEN_CONFIRM", 5),
+        judge_max_per_run=_int("JUDGE_MAX_PER_RUN", 40),
         scan_max_scroll=_int("SCAN_MAX_SCROLL", 15),
         scan_max_items=_int("SCAN_MAX_ITEMS", 500),
         reply_corpus=corpus,

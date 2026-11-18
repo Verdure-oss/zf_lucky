@@ -121,12 +121,17 @@ class Runner:
             self.cfg.scan_buffer_days,
             watermark,
         )
+
+        # 已入库的 hash：连续遇到若干条即可判定「已翻到历史区域」，
+        # 不必再按天数硬扫（实测按天数会翻 100 条，其中大部分早见过）
+        known = self.db.all_hashes()
         log.info(
-            "扫描边界 %s（窗口 %d 天 + 边距 %d 天，水位 %s）",
+            "扫描边界 %s（窗口 %d 天 + 边距 %d 天，水位 %s，已知 %d 条）",
             boundary.strftime("%Y-%m-%d %H:%M"),
             self.cfg.scan_window_days,
             self.cfg.scan_buffer_days,
             watermark_str or "无（首次运行）",
+            len(known),
         )
 
         scanner = Scanner(
@@ -135,8 +140,9 @@ class Runner:
             confirm_count=self.cfg.scan_confirm_count,
             max_scroll=self.cfg.scan_max_scroll,
             max_items=self.cfg.scan_max_items,
+            seen_confirm=self.cfg.scan_seen_confirm,
         )
-        return scanner.scan(boundary)
+        return scanner.scan(boundary, known=known)
 
     def _persist(self, flows: List[ScannedFlow]) -> int:
         new_count = 0
@@ -222,7 +228,9 @@ class Runner:
                     delay_max=self.cfg.request_delay_max,
                 )
             )
-            judge_res = judge_pending(self.db, checker)
+            judge_res = judge_pending(
+                self.db, checker, max_items=self.cfg.judge_max_per_run
+            )
             summary.detail_checked = judge_res.checked
             log.info(
                 "判定完成：查 %d 条，抽奖 %d 条，有效 %d 条",

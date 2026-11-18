@@ -74,16 +74,29 @@ def check_session_live(cfg) -> Dict[str, Any]:
     这是「就绪」的唯一可信判据。
     只看 .env 里有没有配 Cookie 是不够的——Cookie 可能早已过期，
     那样面板会显示「就绪」，用户以为一切正常，实际每轮都跑不起来。
-    （这正是最初发生过的问题：配了 Cookie 就显示就绪，但实际无效。）
 
-    代价：每次调用会开一个浏览器会话，约 10~20 秒。
-    因此结果做短期缓存（默认 60 秒），避免面板刷新时反复拉起浏览器。
+    ⚠️ 必须避开主流程运行期间：
+      探测会开一个真实浏览器会话，而 Selenium 的槽位有限（本机 5 个）。
+      主流程正在跑时再开一个，既浪费资源，也会拖慢主流程（实测把
+      100 条判定拖到 3 分钟以上）。因此运行中直接返回缓存，不做真实探测。
     """
     global _session_cache, _session_cache_at
     import time
 
     now = time.time()
     ttl = 60
+
+    # 主流程运行中：不探测，直接回上次结果（或标记为未知）
+    if _runner_alive():
+        if _session_cache is not None:
+            return _session_cache
+        return {
+            "checked": False,
+            "live": True,  # 正在跑说明会话至少启动时是好的
+            "reason": "主流程运行中，跳过探测",
+            "busy": True,
+        }
+
     if _session_cache is not None and (now - _session_cache_at) < ttl:
         return _session_cache
 

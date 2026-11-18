@@ -266,6 +266,17 @@ class Database:
                 (now_str(), hash_),
             )
 
+    def all_hashes(self) -> set:
+        """
+        已入库的全部 hash。
+
+        扫描器用它判断「连续 N 条都已见过」，从而提前停止滚动。
+        只查 hash 一列，几千条也就几毫秒，不需要额外索引。
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT hash FROM flows")
+            return {r["hash"] for r in cur.fetchall()}
+
     def flows_need_detail(self, limit: int = 500) -> List[Dict[str, Any]]:
         """
         需要查详情的帖子：
