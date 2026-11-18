@@ -223,6 +223,25 @@ class Scanner:
             or 0
         )
 
+    def _wait_cards(self, timeout: int = 25) -> bool:
+        """
+        等待列表卡片渲染完成。
+
+        不能固定 sleep：登录态下首屏要等 Vuex 恢复会话后才会渲染列表，
+        实测未登录时 2 秒就够，已登录时要 5 秒以上。固定等待会导致
+        「no-cards」误判为页面异常。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                n = self.driver.js("return document.querySelectorAll('.list-flow').length;")
+                if n and int(n) > 0:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.8)
+        return False
+
     def scan(self, boundary: datetime) -> List[ScannedFlow]:
         """
         扫描情报专栏，返回去重后的帖子列表（新→旧）。
@@ -232,7 +251,11 @@ class Scanner:
         url = TAG_URL.format(tag_id=self.tag_id)
         log.info("打开情报专栏：%s（边界 %s）", url, boundary.strftime("%Y-%m-%d %H:%M"))
         self.driver.get(url)
-        time.sleep(2)
+
+        if not self._wait_cards():
+            raise RuntimeError(
+                "列表卡片在 25 秒内未渲染（可能是未登录、被限流，或页面结构变更）"
+            )
 
         first = self._grab()
         if not first.get("ok"):

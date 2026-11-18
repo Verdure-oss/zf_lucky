@@ -203,6 +203,24 @@ class Driver:
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
+    def wait_selector(self, css: str, timeout: int = 25) -> bool:
+        """
+        等待某个选择器出现，返回是否等到。
+
+        用于「页面已加载但异步内容还没渲染」的场景。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.raw.execute_script(
+                    "return document.querySelectorAll(arguments[0]).length;", css
+                ):
+                    return True
+            except WebDriverException:
+                pass
+            time.sleep(0.6)
+        return False
+
     def current_url(self) -> str:
         return self.raw.current_url
 

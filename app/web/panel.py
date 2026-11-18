@@ -765,7 +765,10 @@ function loginCancel(){
   }).catch(function(e){ toast('请求失败：' + e); });
 }
 
-// 登录会话运行中时，每 4 秒自动检测一次是否已登录
+// 登录会话运行中时定期检测是否已登录。
+// 间隔取 10 秒而非 4 秒：检测本身会发请求，轮询过密会把接口打到限流
+// （实测 4 秒一次会让 /v2/user/card 返回 500「操作太频繁了」，
+//   进而被误判为未登录，导致用户登录成功却一直看到「尚未登录」）。
 {% if v['login'].running %}
 setInterval(function(){
   fetch('/api/login/status').then(function(r){ return r.json(); }).then(function(d){
@@ -776,7 +779,7 @@ setInterval(function(){
       }
     }
   }).catch(function(){});
-}, 4000);
+}, 10000);
 {% endif %}
 </script>
 </body>
