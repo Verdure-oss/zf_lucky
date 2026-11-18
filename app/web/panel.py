@@ -250,6 +250,16 @@ def build_view() -> Dict[str, Any]:
     except Exception:
         outcome_stats = {"won": 0, "lost": 0, "awaiting": 0}
 
+    # 历史战绩
+    try:
+        history = db.history_stats()
+    except Exception as exc:
+        log.warning("历史统计失败：%s", exc)
+        history = {"total": 0, "won": 0, "lost": 0, "decided": 0,
+                   "win_rate": 0, "by_day": [], "winners": [],
+                   "runs": 0, "run_participated": 0, "run_failed": 0,
+                   "run_success": 0}
+
     # 帖子列表
     rows = db.list_for_panel(limit=300)
     items: List[Dict[str, Any]] = []
@@ -288,8 +298,23 @@ def build_view() -> Dict[str, Any]:
         else:
             state_label, state_cls = label, cls
 
+        # 供前端分区筛选的分类键
+        if outcome == "won":
+            filter_key = "won"
+        elif outcome == "lost":
+            filter_key = "lost"
+        elif state == "done":
+            filter_key = "awaiting"
+        elif state in ("failed", "give_up"):
+            filter_key = "failed"
+        elif state is None:
+            filter_key = "unjoined"
+        else:
+            filter_key = "pending"
+
         items.append(
             {
+                "filter": filter_key,
                 "hash": r.get("hash"),
                 "title": (r.get("title") or "")[:60],
                 "author": r.get("author_nick") or "",
@@ -336,6 +361,15 @@ def build_view() -> Dict[str, Any]:
         "items": items,
         "counts": counts,
         "outcome": outcome_stats,
+        "history": history,
+        "filters": {
+            "all": sum(1 for i in items),
+            "awaiting": sum(1 for i in items if i["filter"] == "awaiting"),
+            "won": sum(1 for i in items if i["filter"] == "won"),
+            "lost": sum(1 for i in items if i["filter"] == "lost"),
+            "failed": sum(1 for i in items if i["filter"] == "failed"),
+            "pending": sum(1 for i in items if i["filter"] == "pending"),
+        },
         "total": len(items),
         "last": last,
         "last_running": last_running,
@@ -720,6 +754,10 @@ PAGE = r"""
   tr:hover td{background:rgba(127,127,127,.04)}
   .t{font-weight:500;display:block;max-width:330px;overflow:hidden;
      text-overflow:ellipsis;white-space:nowrap}
+  td.nowrap,.nowrap{white-space:nowrap}
+  /* 操作时间紧凑显示：关/回/赞 各一行，字号更小 */
+  .ops{font-size:11px;line-height:1.5;color:var(--muted);white-space:nowrap}
+  .ops i{font-style:normal;display:inline-block;width:12px;opacity:.7}
   .meta{color:var(--muted);font-size:11px;margin-top:2px}
   .pill{display:inline-block;padding:1.5px 8px;border-radius:999px;font-size:11px;
         font-weight:600;white-space:nowrap}
@@ -734,6 +772,33 @@ PAGE = r"""
   .tag{font-size:10px;color:var(--muted);border:1px solid var(--line);
        padding:0 5px;border-radius:4px;margin-left:4px}
   .empty{padding:44px;text-align:center;color:var(--muted)}
+  .filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 10px}
+  .chip{background:transparent;border:1px solid var(--line);color:var(--muted);
+        padding:5px 12px;border-radius:999px;cursor:pointer;font-size:12.5px;
+        transition:.15s;display:inline-flex;gap:5px;align-items:center}
+  .chip b{font-weight:600;opacity:.8}
+  .chip:hover{border-color:var(--accent);color:var(--accent)}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#04120e;font-weight:600}
+  .chip.on b{opacity:1}
+  .search{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+          padding:5px 11px;border-radius:7px;font-size:12.5px;width:210px}
+  .history{margin-top:22px;background:var(--card);border:1px solid var(--line);
+           border-radius:10px;padding:14px 16px}
+  .history h3{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--muted);
+              letter-spacing:.4px;text-transform:uppercase}
+  .hgrid{display:flex;gap:26px;flex-wrap:wrap;margin-bottom:12px}
+  .hitem{display:flex;flex-direction:column;gap:1px}
+  .hitem b{font-size:20px;font-weight:600}
+  .hitem span{font-size:11px;color:var(--muted)}
+  .bars{display:flex;flex-direction:column;gap:4px;margin-top:8px}
+  .bar-row{display:flex;align-items:center;gap:9px;font-size:12px}
+  .bar-date{color:var(--muted);width:74px;flex-shrink:0}
+  .bar-track{flex:1;height:7px;background:rgba(127,127,127,.14);border-radius:4px;
+             overflow:hidden;max-width:320px}
+  .bar-fill{height:100%;background:var(--accent);border-radius:4px}
+  .bar-num{color:var(--muted);font-size:11px;min-width:44px}
+  .winline{font-size:12.5px;padding:5px 0;border-bottom:1px solid var(--line)}
+  .winline:last-child{border-bottom:none}
   .reason{color:var(--err);font-size:11px;margin-top:2px;max-width:270px}
   .note{color:var(--muted);font-size:11px}
   .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
@@ -864,8 +929,73 @@ PAGE = r"""
   </div>
   {% endif %}
 
+  {# ---------------- 历史战绩 ---------------- #}
+  <div class="history" id="hist">
+    <h3 onclick="toggleHist()" style="cursor:pointer;user-select:none">历史战绩 <span id="histArrow" style="opacity:.6">▾</span></h3>
+    <div class="hgrid" id="histBody">
+      <div class="hitem"><b>{{ v.history['total'] }}</b><span>累计参与</span></div>
+      <div class="hitem"><b style="color:var(--win)">{{ v.history['won'] }}</b><span>中奖次数</span></div>
+      <div class="hitem"><b>{{ v.history['lost'] }}</b><span>未中奖</span></div>
+      <div class="hitem"><b>{{ v.history['decided'] }}</b><span>已开奖</span></div>
+      <div class="hitem"><b>{{ v.history['win_rate'] }}%</b><span>中奖率</span></div>
+      <div class="hitem"><b>{{ v.history['runs'] }}</b><span>运行轮次</span></div>
+      <div class="hitem"><b>{{ v.history['run_success'] }}</b><span>成功轮次</span></div>
+      <div class="hitem"><b>{{ v.history['run_failed'] }}</b><span>累计失败</span></div>
+    </div>
+
+    {% if v.history['by_day'] %}
+    <div class="bars">
+      {% set maxn = v.history['by_day'] | map(attribute='participated') | max %}
+      {% for d in v.history['by_day'][:14] %}
+      <div class="bar-row">
+        <span class="bar-date">{{ d.date[5:] }}</span>
+        <div class="bar-track">
+          <div class="bar-fill" style="width: {{ (d.participated / (maxn or 1) * 100) | round(1) }}%"></div>
+        </div>
+        <span class="bar-num">{{ d.participated }} 条{% if d.won %} · 🎉{{ d.won }}{% endif %}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="sub">还没有参与记录</div>
+    {% endif %}
+
+    {% if v.history['winners'] %}
+    <div style="margin-top:14px">
+      <div class="sub" style="margin-bottom:6px">中奖明细</div>
+      {% for w in v.history['winners'] %}
+      <div class="winline">
+        🏆 <b style="color:var(--win)">{{ w.prize }}</b>
+        · {{ w.title }}
+        {% if w.author %}<span class="sub">by {{ w.author }}</span>{% endif %}
+        <a href="https://www.zfrontier.com/app/flow/{{ w.hash }}"
+           target="_blank" rel="noopener" style="color:var(--accent);font-size:11px">查看 ↗</a>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+
   {% if v['items'] %}
-  <table>
+  <div class="filters">
+    <button class="chip on" data-f="all" onclick="setFilter('all',this)">
+      全部 <b>{{ v.filters['all'] }}</b></button>
+    <button class="chip" data-f="awaiting" onclick="setFilter('awaiting',this)">
+      待开奖 <b>{{ v.filters['awaiting'] }}</b></button>
+    <button class="chip" data-f="won" onclick="setFilter('won',this)">
+      🎉 中奖 <b>{{ v.filters['won'] }}</b></button>
+    <button class="chip" data-f="lost" onclick="setFilter('lost',this)">
+      未中奖 <b>{{ v.filters['lost'] }}</b></button>
+    <button class="chip" data-f="failed" onclick="setFilter('failed',this)">
+      失败 <b>{{ v.filters['failed'] }}</b></button>
+    <button class="chip" data-f="pending" onclick="setFilter('pending',this)">
+      待执行 <b>{{ v.filters['pending'] }}</b></button>
+    <span class="grow"></span>
+    <input id="q" class="search" placeholder="搜索标题 / 作者 / hash" oninput="applyFilter()">
+  </div>
+
+  <table id="tbl">
     <thead>
       <tr>
         <th>帖子</th>
@@ -879,7 +1009,9 @@ PAGE = r"""
     </thead>
     <tbody>
     {% for it in v['items'] %}
-      <tr class="{{ 'row-won' if it.outcome == 'won' else '' }}">
+      <tr class="{{ 'row-won' if it.outcome == 'won' else '' }}"
+          data-filter="{{ it['filter'] }}"
+          data-q="{{ (it.title ~ ' ' ~ it.author ~ ' ' ~ it.hash)|lower }}">
         <td>
           <a class="t" href="https://www.zfrontier.com/app/flow/{{ it.hash }}"
              target="_blank" rel="noopener"
@@ -891,7 +1023,7 @@ PAGE = r"""
           </div>
         </td>
         <td class="hide-sm">{{ it.author }}</td>
-        <td class="hide-sm">{{ it.lottery_at }}</td>
+        <td class="hide-sm nowrap">{{ it.lottery_at }}</td>
         <td class="hide-sm">{{ it.prizes }}</td>
         <td>
           <span class="pill {{ it.state_cls }}">{{ it.state_label }}</span>
@@ -900,11 +1032,13 @@ PAGE = r"""
           {% endif %}
           {% if it.state_note %}<div class="reason">{{ it.state_note[:80] }}</div>{% endif %}
         </td>
-        <td class="hide-sm note">
-          {% if it.followed_at %}关 {{ it.followed_at }}<br>{% endif %}
-          {% if it.replied_at %}回 {{ it.replied_at }}<br>{% endif %}
-          {% if it.liked_at %}赞 {{ it.liked_at }}{% endif %}
+        <td class="hide-sm">
+          <div class="ops">
+          {% if it.followed_at %}<i>关</i>{{ it.followed_at }}<br>{% endif %}
+          {% if it.replied_at %}<i>回</i>{{ it.replied_at }}<br>{% endif %}
+          {% if it.liked_at %}<i>赞</i>{{ it.liked_at }}{% endif %}
           {% if not it.followed_at and not it.replied_at and not it.liked_at %}—{% endif %}
+          </div>
         </td>
         <td>
           {% if not it.expired %}
@@ -915,6 +1049,8 @@ PAGE = r"""
     {% endfor %}
     </tbody>
   </table>
+  <div id="noresult" class="empty" style="display:none">没有符合条件的记录</div>
+
   {% else %}
   <div class="empty">
     还没有记录。<br>

@@ -668,6 +668,103 @@ class Database:
                 "awaiting": int(row["awaiting"] or 0),
             }
 
+    def history_stats(self, days: int = 30) -> Dict[str, Any]:
+        """
+        历史战绩：总量、中奖率、按天趋势、中奖明细。
+
+        只用已开奖的记录算中奖率——待开奖的不该计入分母，
+        否则「中了没有」永远显得很低。
+        """
+        with self._cursor() as cur:
+            # 总量
+            cur.execute("SELECT COUNT(*) c FROM participations WHERE state = 'done'")
+            total = int(cur.fetchone()["c"] or 0)
+
+            cur.execute(
+                "SELECT COUNT(*) c FROM participations WHERE outcome = 'won'"
+            )
+            won = int(cur.fetchone()["c"] or 0)
+
+            cur.execute(
+                "SELECT COUNT(*) c FROM participations WHERE outcome = 'lost'"
+            )
+            lost = int(cur.fetchone()["c"] or 0)
+
+            # 中奖率只对已开奖的计算
+            decided = won + lost
+            win_rate = (won / decided * 100) if decided else 0.0
+
+            # 按天：参与数与中奖数
+            cur.execute(
+                """
+                SELECT substr(updated_at, 1, 10) AS d,
+                       COUNT(*) AS participated,
+                       SUM(CASE WHEN outcome = 'won' THEN 1 ELSE 0 END) AS won
+                FROM participations
+                WHERE state = 'done' AND updated_at IS NOT NULL
+                GROUP BY d
+                ORDER BY d DESC
+                LIMIT ?
+                """,
+                (days,),
+            )
+            by_day = [
+                {
+                    "date": r["d"],
+                    "participated": int(r["participated"] or 0),
+                    "won": int(r["won"] or 0),
+                }
+                for r in cur.fetchall()
+            ]
+
+            # 中奖明细
+            cur.execute(
+                """
+                SELECT p.hash, p.prize, p.checked_at, f.title, f.author_nick, f.lottery_at
+                FROM participations p
+                LEFT JOIN flows f ON f.hash = p.hash
+                WHERE p.outcome = 'won'
+                ORDER BY p.checked_at DESC
+                LIMIT 50
+                """
+            )
+            winners = [
+                {
+                    "hash": r["hash"],
+                    "title": (r["title"] or "")[:40],
+                    "prize": r["prize"] or "",
+                    "author": r["author_nick"] or "",
+                    "checked_at": r["checked_at"] or "",
+                }
+                for r in cur.fetchall()
+            ]
+
+            # 运行轮次统计
+            cur.execute(
+                """
+                SELECT COUNT(*) runs,
+                       SUM(participated_cnt) p,
+                       SUM(failed_cnt) f,
+                       SUM(CASE WHEN result = 'success' THEN 1 ELSE 0 END) ok
+                FROM run_logs
+                """
+            )
+            rr = cur.fetchone()
+
+        return {
+            "total": total,
+            "won": won,
+            "lost": lost,
+            "decided": decided,
+            "win_rate": round(win_rate, 2),
+            "by_day": by_day,
+            "winners": winners,
+            "runs": int(rr["runs"] or 0),
+            "run_participated": int(rr["p"] or 0),
+            "run_failed": int(rr["f"] or 0),
+            "run_success": int(rr["ok"] or 0),
+        }
+
     def list_for_panel(self, limit: int = 200) -> List[Dict[str, Any]]:
         """面板用的联表视图。"""
         with self._cursor() as cur:
