@@ -220,14 +220,18 @@ class Participant:
 
     # ---------- 回复 ----------
 
-    def send_reply(self, flow_id: int, hash_: str) -> Dict[str, Any]:
+    def send_reply(self, flow_id: int, hash_: str, title: str = "", text: str = "") -> Dict[str, Any]:
         """
         发回复——真实点编辑器、真实打字、真实点发送。
 
-        优先用站点自带的快捷按钮（抽奖帖有「点击抽奖」，内容为冲冲冲），
-        避免往富文本里塞内容时被站点校验拦掉。
+        ⚠️ 不使用站点的「一键冲冲冲」按钮：
+           前端 fastSubmit() 提交的是写死的 fastReplyContent（默认 "冲冲冲"），
+           无法自定义内容。要让评论与文章内容相关，只能走编辑器输入。
+
+        :param title/text: 帖子标题与正文，用于生成与内容相关的评论
         """
-        content = self.corpus.pick()
+        content = self.corpus.pick_for(title=title, text=text)
+        log.info("  生成评论（结合内容）：%r", content)
 
         # 确保在帖子页
         if hash_ not in (self.driver.current_url() or ""):
@@ -235,71 +239,84 @@ class Participant:
 
         self._consume_write()
 
-        # 方式一：快捷提交按钮（抽奖帖专有，最稳）
-        used_fast = False
+        # 点编辑器激活（编辑器初始是 ql-disabled，需先点一下）
         try:
-            fasts = self.driver.find_all(SEL_FAST_SUBMIT)
-            fast = next(
-                (f for f in fasts if "抽奖" in (f.text or "") or f.is_displayed()),
-                None,
-            )
-            if fast is not None:
-                self.driver.safe_click(fast, "快捷回复按钮")
-                used_fast = True
-                log.info("  已点击站点快捷回复按钮：%r", (fast.text or "").strip())
+            editor_box = self.driver.find(SEL_EDITOR, timeout=10)
         except Exception as exc:
-            log.debug("快捷按钮不可用，改用编辑器：%s", exc)
+            raise StepError(f"未找到回复编辑器：{exc}") from exc
 
-        # 方式二：点编辑器 → 输入 → 点发送
-        if not used_fast:
+        self.driver.safe_click(editor_box, "回复编辑器")
+        self._pause(1, 2)
+
+        try:
+            editor = self.driver.find(SEL_QUILL, timeout=10)
+        except Exception as exc:
+            raise StepError(f"编辑器未激活：{exc}") from exc
+
+        # 聚焦并把光标放到末尾，确保输入进内容区
+        try:
+            self.driver.raw.execute_script(
+                "arguments[0].focus();"
+                "var r=document.createRange();r.selectNodeContents(arguments[0]);"
+                "r.collapse(false);var s=window.getSelection();"
+                "s.removeAllRanges();s.addRange(r);",
+                editor,
+            )
+        except Exception:
+            pass
+
+        editor.send_keys(content)
+        self._pause(1, 2)
+        log.info("  已输入评论内容")
+
+        # 校验输入是否真的进了编辑器（Quill 有时会吞输入）
+        typed = ""
+        try:
+            typed = (editor.text or "").strip()
+        except Exception:
+            pass
+        if content not in typed and typed != content:
+            # 再用 JS 兜底写入
+            log.warning("  编辑器内容与预期不符（%r），改用 JS 写入", typed[:20])
+            self.driver.js(
+                """
+                var el = arguments[0], txt = arguments[1];
+                el.focus();
+                el.innerHTML = '';
+                var p = document.createElement('p');
+                p.textContent = txt;
+                el.appendChild(p);
+                """,
+                editor,
+                content,
+            )
+            self._pause(0.5, 1)
+
+        # 找发送按钮（编辑器激活后才会出现确认按钮）
+        submit = None
+        for sel in ("a.plugin-btn.submit", "button.button-black"):
             try:
-                editor = self.driver.find(SEL_QUILL, timeout=10)
-            except Exception as exc:
-                raise StepError(f"未找到回复输入框：{exc}") from exc
-
-            self.driver.safe_click(editor, "回复输入框")
-            self._pause(1, 2)
-
-            # Quill 是 contenteditable，send_keys 有时不进内容，先聚焦再输入
-            try:
-                self.driver.raw.execute_script(
-                    "arguments[0].focus();"
-                    "var r=document.createRange();r.selectNodeContents(arguments[0]);"
-                    "r.collapse(false);var s=window.getSelection();"
-                    "s.removeAllRanges();s.addRange(r);",
-                    editor,
-                )
-            except Exception:
-                pass
-            editor.send_keys(content)
-            self._pause(1, 2)
-            log.info("  已输入回复内容：%r", content)
-
-            # 找发送按钮
-            submit = None
-            for sel in ("a.plugin-btn.submit", "button.button-black", ".editor .button"):
-                try:
-                    cands = self.driver.find_all(sel)
-                    submit = next(
-                        (c for c in cands if (c.text or "").strip() in ("发送", "回复", "")),
-                        cands[0] if cands else None,
-                    )
-                    if submit is not None:
+                for cand in self.driver.find_all(sel):
+                    txt = (cand.text or "").strip()
+                    if txt in ("回复", "发送") and cand.is_displayed():
+                        submit = cand
                         break
-                except Exception:
-                    continue
-            if submit is None:
-                raise StepError("未找到发送按钮")
-            self.driver.safe_click(submit, "发送按钮")
+                if submit is not None:
+                    break
+            except Exception:
+                continue
 
-        log.info("  已发送回复")
+        if submit is None:
+            raise StepError("未找到发送按钮")
+        self.driver.safe_click(submit, "发送按钮")
+        log.info("  已点击发送")
 
         # 回读：抽奖帖回复楼层会被折叠，必须 unfold=1
         for attempt in range(5):
             time.sleep(2 + attempt)
-            if self._find_my_reply(flow_id):
+            info = self._latest_my_reply(flow_id)
+            if info is not None:
                 log.info("  回复已确认（第 %d 次回读）", attempt + 1)
-                info = self._latest_my_reply(flow_id)
                 return {
                     "reply_id": info.get("id"),
                     "floor": info.get("floor"),
@@ -422,7 +439,25 @@ class Participant:
 
             # 2. 回复（已完成则绝不重复——回复不可撤销）
             if not done.get("replied_at"):
-                info = self.send_reply(int(flow_id), hash_)
+                # 取标题与正文，用于生成与内容相关的评论
+                post_title = flow_row.get("title") or ""
+                post_text = ""
+                try:
+                    post_text = (
+                        self.driver.js(
+                            """
+                            var el = document.querySelector('.item-body, .flow-content, .article');
+                            return el ? (el.innerText || '').slice(0, 800) : '';
+                            """
+                        )
+                        or ""
+                    )
+                except Exception:
+                    pass
+
+                info = self.send_reply(
+                    int(flow_id), hash_, title=post_title, text=post_text
+                )
                 self.db.mark_replied(hash_, info["reply_id"], info["floor"])
                 result.steps.append("reply")
                 result.reply_id = info["reply_id"]

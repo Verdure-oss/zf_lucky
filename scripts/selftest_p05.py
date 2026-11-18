@@ -104,7 +104,9 @@ class FakeDriver:
 
     def find_all(self, css):
         el = self._elements.get(css)
-        return [el] if el else []
+        if not el:
+            return []
+        return el if isinstance(el, list) else [el]
 
     def safe_click(self, element, label="元素", timeout=8):
         self.actions.append(("click", label))
@@ -281,10 +283,19 @@ def build_driver(api):
         'a[href*="/app/user/UH77"]': FakeElement("作者", displayed=True),
         'a[href*="/app/user/UH90"]': FakeElement("作者", displayed=True),
         ".bt-green-border.follow": FakeElement("关注 TA", on_click=on_follow_click),
+        ".target_comment-editor": FakeElement(""),
         ".target_comment-editor .ql-editor": FakeElement(""),
         "a.plugin-btn.submit": FakeElement("点击抽奖"),
+        ".target-zan-placeholder": None,
         ".target_zan-flow": FakeElement("", cls="btn zan"),
+        # 编辑器激活后出现的确认按钮（文案为「回复」）
+        "button.button-black": FakeElement("回复"),
     }
+    # a.plugin-btn.submit 既可能是「点击抽奖」也可能是「回复」，给两个
+    d._elements["a.plugin-btn.submit"] = [
+        FakeElement("回复"),
+        FakeElement("回复"),
+    ]
     return d
 
 
@@ -368,7 +379,7 @@ def main() -> int:
         check("缺 hash 时拒绝执行", ok5b)
         check("且没有乱点", not any(a[0] == "click" for a in d5b.actions), str(d5b.actions))
 
-        print("\n[6] 回复：优先点站点快捷按钮")
+        print("\n[6] 回复：走编辑器输入（不用快捷按钮，因其内容写死）")
         api5 = FakeApi()
         api5.register("H5", 1005, 80, "UH80")
         add_flow(db, "H5", 1005, author_uid=80)
@@ -380,8 +391,18 @@ def main() -> int:
         except Exception:
             pass
         check(
-            "点过快捷提交按钮",
-            any(a == ("click", "快捷回复按钮") for a in d5.actions),
+            "点击了编辑器",
+            any(a == ("click", "回复编辑器") for a in d5.actions),
+            str(d5.actions),
+        )
+        check(
+            "没有用快捷按钮（其内容固定为冲冲冲）",
+            not any(a == ("click", "快捷回复按钮") for a in d5.actions),
+            str(d5.actions),
+        )
+        check(
+            "点击了发送按钮",
+            any(a == ("click", "发送按钮") for a in d5.actions),
             str(d5.actions),
         )
 
@@ -422,7 +443,7 @@ def main() -> int:
         res8 = p8.participate(db.get_flow("H8"))
         check("成功", res8.success, str(res8.fail_reason or ""))
         check("未点关注按钮", not any(a == ("click", "关注按钮") for a in d8.actions), str(d8.actions))
-        check("未点快捷回复", not any(a == ("click", "快捷回复按钮") for a in d8.actions), str(d8.actions))
+        check("未点编辑器（回复已完成）", not any(a == ("click", "回复编辑器") for a in d8.actions), str(d8.actions))
         check("沿用了原 reply_id", res8.reply_id == 777, str(res8.reply_id))
 
         print("\n[10] 预算耗尽 → 中止整轮")
