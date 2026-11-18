@@ -146,6 +146,34 @@ def seconds_until(target: str, now: Optional[datetime] = None) -> float:
     return (next_run_at(target, now) - now).total_seconds()
 
 
+def _stop_watch_vnc_if_needed() -> None:
+    """
+    如果本轮是「运行并观看」触发的，跑完把网关关掉。
+
+    自动化运行时会开很多页面，忘记关就是长期暴露，
+    因此这里自动收尾，而不是等用户手动关。
+    """
+    import os as _os
+    import subprocess
+    import sys as _sys
+
+    flag = "/tmp/zf_watch_vnc"
+    if not _os.path.exists(flag):
+        return
+    try:
+        _os.unlink(flag)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            [_sys.executable, "/app/scripts/vnc_gate.py", "stop"],
+            capture_output=True, text=True, timeout=15,
+        )
+        log.info("本轮为「运行并观看」，已自动关闭浏览器观看")
+    except Exception as exc:
+        log.warning("关闭浏览器观看失败：%s", exc)
+
+
 def run_once(cfg, db: Database) -> None:
     """执行一轮，异常不外溢（避免进程退出）。"""
     lock = SingleInstance(LOCK_FILE)
@@ -158,6 +186,7 @@ def run_once(cfg, db: Database) -> None:
         log.exception("本轮运行出现未捕获异常（已忽略，进程继续）")
     finally:
         lock.release()
+        _stop_watch_vnc_if_needed()
 
 
 def main() -> int:

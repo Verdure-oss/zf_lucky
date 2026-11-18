@@ -31,8 +31,11 @@ log = logging.getLogger(__name__)
 TRIGGER_FILE = "/tmp/zf_lucky_trigger"
 PAUSE_FILE = "/tmp/zf_lucky_paused"
 VNC_FLAG_FILE = "/tmp/zf_vnc_enabled"
+# 用户勾选「运行并观看」时写入，主循环结束后据此关闭网关
+WATCH_FLAG_FILE = "/tmp/zf_watch_vnc"
 VNC_GATE_SCRIPT = "/app/scripts/vnc_gate.py"
 ENV_PATH = "/app/.env"
+LOG_DIR = "/app/logs"
 
 app = Flask(__name__)
 _db: Optional[Database] = None
@@ -343,15 +346,41 @@ def api_status():
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
-    """写触发文件，由主循环串行执行。"""
+    """
+    写触发文件，由主循环串行执行。
+
+    可选 watch_vnc=true：运行期间自动开启浏览器观看，
+    让用户能实时看到每一步操作（关注/回复/点赞），便于核对是否正确。
+    任务结束后由主循环关闭网关。
+    """
     if os.path.exists(PAUSE_FILE):
         return jsonify({"ok": False, "msg": "任务已暂停，请先恢复"}), 409
+
+    body = request.get_json(silent=True) or {}
+    watch = bool(body.get("watch_vnc", False))
+
     try:
         with open(TRIGGER_FILE, "w") as fh:
             fh.write(datetime.now().isoformat())
     except OSError as exc:
         return jsonify({"ok": False, "msg": f"无法创建触发文件：{exc}"}), 500
-    return jsonify({"ok": True, "msg": "已提交，主进程将在数秒内开始"})
+
+    vnc_msg = ""
+    if watch:
+        # 预置标记：主循环跑完会依据它关闭网关
+        try:
+            with open(WATCH_FLAG_FILE, "w") as fh:
+                fh.write("1")
+        except OSError:
+            pass
+        v = vnc_toggle(True)
+        vnc_msg = "，浏览器观看已开启" if (v.get("running") or v.get("ok")) else "，但浏览器观看开启失败"
+
+    return jsonify({
+        "ok": True,
+        "msg": f"已提交，主进程将在数秒内开始{vnc_msg}",
+        "watch": watch,
+    })
 
 
 @app.route("/api/pause", methods=["POST"])
@@ -380,6 +409,48 @@ def api_check():
         return jsonify(check_session_live(_cfg))
     except Exception as exc:
         return jsonify({"checked": True, "live": False, "reason": str(exc)}), 500
+
+
+@app.route("/api/logs")
+def api_logs():
+    """读取日志尾部，支持级别与关键字过滤。"""
+    from . import logs as logs_mod
+
+    try:
+        n = int(request.args.get("n", 300))
+    except (TypeError, ValueError):
+        n = 300
+    data = logs_mod.tail(
+        LOG_DIR,
+        n=n,
+        level=request.args.get("level", ""),
+        keyword=request.args.get("keyword", ""),
+    )
+    return jsonify(data)
+
+
+@app.route("/api/logs/download")
+def api_logs_download():
+    """下载指定日志文件（默认最新）。"""
+    from flask import send_file
+
+    from . import logs as logs_mod
+
+    files = logs_mod.list_log_files(LOG_DIR)
+    if not files:
+        return jsonify({"ok": False, "msg": "没有日志文件"}), 404
+    name = request.args.get("file") or files[0]["name"]
+    # 防目录穿越：只允许日志目录下的已知文件
+    if name not in {f["name"] for f in files}:
+        return jsonify({"ok": False, "msg": "非法文件名"}), 400
+    return send_file(os.path.join(LOG_DIR, name), as_attachment=True, download_name=name)
+
+
+@app.route("/logs")
+def logs_page():
+    """独立的日志查看页（轮询刷新，适合边跑边看）。"""
+    view = build_view()
+    return render_template_string(LOGS_PAGE, v=view)
 
 
 @app.route("/api/vnc", methods=["GET", "POST"])
@@ -653,7 +724,9 @@ PAGE = r"""
       <span>运行状态</span>
     </div>
 
-    <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>立即运行</button>
+    <button class="primary" onclick="doRun(true)" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>运行并观看</button>
+    <button onclick="doRun(false)" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>静默运行</button>
+    <a href="/logs" target="_blank" rel="noopener" style="text-decoration:none"><button>日志</button></a>
     <button onclick="togglePause()">{% if v.paused %}恢复{% else %}暂停{% endif %}</button>
   </div>
 
@@ -802,9 +875,15 @@ function post(url, body){
     body: JSON.stringify(body || {})
   }).then(function(r){ return r.json(); });
 }
-function doRun(){
-  post('/api/run', {}).then(function(d){
+function doRun(watch){
+  post('/api/run', {watch_vnc: !!watch}).then(function(d){
     toast(d.msg || (d.ok ? '已提交' : '失败'));
+    if (d.ok && watch){
+      // 顺带打开浏览器画面，方便同时观察
+      setTimeout(function(){
+        window.open('/vnc/vnc.html?autoconnect=1&resize=scale', '_blank');
+      }, 3000);
+    }
     if (d.ok) setTimeout(function(){ location.reload(); }, 1800);
   }).catch(function(e){ toast('请求失败：' + e); });
 }
@@ -876,6 +955,170 @@ setInterval(function(){
   }).catch(function(){});
 }, 10000);
 {% endif %}
+</script>
+</body>
+</html>
+"""
+
+# ---------------- 日志查看页 ----------------
+
+LOGS_PAGE = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>zf_lucky · 日志</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#252a33;--fg:#e6e9ef;--muted:#8b93a1;
+        --ok:#3fb950;--warn:#d29922;--err:#f85149;--info:#58a6ff;--accent:#02c39a}
+  @media (prefers-color-scheme:light){
+    :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6eb;--fg:#1f2328;--muted:#6e7781;
+          --ok:#1a7f37;--warn:#9a6700;--err:#cf222e;--info:#0969da;--accent:#0b8f74}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  h1{font-size:16px;margin:0;font-weight:600}
+  a{color:var(--accent);text-decoration:none}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+       background:var(--card);border:1px solid var(--line);border-radius:9px;
+       padding:10px 12px;margin-bottom:12px}
+  select,input{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+               padding:5px 9px;border-radius:6px;font-size:13px}
+  input{width:200px}
+  button{background:transparent;border:1px solid var(--line);color:var(--fg);
+         padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.on{background:var(--accent);border-color:var(--accent);color:#04120e;font-weight:600}
+  .meta{color:var(--muted);font-size:12px;margin-left:auto}
+  #log{background:var(--card);border:1px solid var(--line);border-radius:9px;
+       padding:10px 12px;height:calc(100vh - 190px);overflow:auto;
+       font:12px/1.62 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       white-space:pre-wrap;word-break:break-all}
+  .ln{display:flex;gap:8px;padding:1px 0}
+  .ts{color:var(--muted);flex-shrink:0}
+  .lv{flex-shrink:0;width:58px;font-weight:600}
+  .lv.DEBUG{color:var(--muted)} .lv.INFO{color:var(--info)}
+  .lv.WARNING{color:var(--warn)} .lv.ERROR,.lv.CRITICAL{color:var(--err)}
+  .msg{flex:1;min-width:0}
+  .row-ERROR{background:rgba(248,81,73,.07)}
+  .row-WARNING{background:rgba(210,153,34,.06)}
+  .hint{color:var(--muted);font-size:12px;padding:20px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>执行日志</h1>
+    <a href="/">← 返回面板</a>
+    {% if v['vnc'].running %}
+    <a href="/vnc/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noopener">浏览器画面 ↗</a>
+    {% endif %}
+    <span class="meta" id="meta"></span>
+  </header>
+
+  <div class="bar">
+    <label>级别
+      <select id="level" onchange="load()">
+        <option value="">全部</option>
+        <option value="INFO">INFO 及以上</option>
+        <option value="WARNING">WARNING 及以上</option>
+        <option value="ERROR">仅 ERROR</option>
+      </select>
+    </label>
+    <label>关键字 <input id="kw" placeholder="如 hash / 抽奖 / 失败" oninput="debounceLoad()"></label>
+    <label>行数
+      <select id="n" onchange="load()">
+        <option>200</option>
+        <option selected>500</option>
+        <option>1000</option>
+        <option>2000</option>
+      </select>
+    </label>
+    <button id="auto" class="on" onclick="toggleAuto()">自动刷新</button>
+    <button onclick="load()">立即刷新</button>
+    <button onclick="scrollBottom()">跳到最新</button>
+    <a href="/api/logs/download" style="margin-left:auto"><button>下载日志</button></a>
+  </div>
+
+  <div id="log"><div class="hint">加载中…</div></div>
+</div>
+
+<script>
+var autoOn = true, timer = null, tId = null;
+
+function esc(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function atBottom(el){
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+}
+function scrollBottom(){
+  var el = document.getElementById('log');
+  el.scrollTop = el.scrollHeight;
+}
+
+function load(){
+  var level = document.getElementById('level').value;
+  var kw = document.getElementById('kw').value.trim();
+  var n = document.getElementById('n').value;
+  var el = document.getElementById('log');
+  var stick = atBottom(el);
+
+  var url = '/api/logs?n=' + encodeURIComponent(n)
+          + '&level=' + encodeURIComponent(level)
+          + '&keyword=' + encodeURIComponent(kw);
+
+  fetch(url).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.lines || !d.lines.length){
+      el.innerHTML = '<div class="hint">暂无匹配日志</div>';
+      return;
+    }
+    var html = d.lines.map(function(x){
+      var lv = x.level || '';
+      var cls = lv ? 'row-' + lv : '';
+      return '<div class="ln ' + cls + '">'
+        + '<span class="ts">' + esc(x.ts || '') + '</span>'
+        + '<span class="lv ' + esc(lv) + '">' + esc(lv) + '</span>'
+        + '<span class="msg">' + esc(x.msg) + '</span>'
+        + '</div>';
+    }).join('');
+    el.innerHTML = html;
+    if (stick) scrollBottom();
+
+    var m = '文件 ' + (d.file || '-') + ' ｜ 显示 ' + d.matched + ' / ' + d.total + ' 行';
+    if (d.truncated) m += ' ｜ 已截断';
+    m += ' ｜ ' + new Date().toLocaleTimeString();
+    document.getElementById('meta').textContent = m;
+  }).catch(function(e){
+    el.innerHTML = '<div class="hint">加载失败：' + esc(e) + '</div>';
+  });
+}
+
+function debounceLoad(){
+  clearTimeout(tId);
+  tId = setTimeout(load, 350);
+}
+
+function toggleAuto(){
+  autoOn = !autoOn;
+  var b = document.getElementById('auto');
+  b.className = autoOn ? 'on' : '';
+  b.textContent = autoOn ? '自动刷新' : '已暂停';
+  schedule();
+}
+
+function schedule(){
+  clearInterval(timer);
+  if (autoOn) timer = setInterval(load, 3000);
+}
+
+load();
+schedule();
 </script>
 </body>
 </html>
