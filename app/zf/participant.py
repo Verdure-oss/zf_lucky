@@ -117,31 +117,40 @@ class Participant:
 
     def ensure_followed(self, author_hash: Optional[str], author_uid: int) -> None:
         """
-        确保已关注作者——真实点击作者名进主页，再点关注按钮。
+        确保已关注作者——直接进作者主页，看按钮文案决定是否需要点。
 
-        已关注则跳过。关注后回读 /v2/user/detail 的 followed 确认。
+        为什么不再依赖 author_hash：
+          实测 flow.user 里**没有 hash_id 字段**（只有 view_url），
+          原实现靠 hash 预查 /v2/user/detail，hash 为 None 时直接报
+          「缺少作者 hash」整条失败。而主页上的关注按钮本身就带状态文案
+          （「关注 TA」/「已关注」），根本不需要 hash 预查。
+
+        流程：帖子页点作者名 → 进主页 → 读按钮文案
+              → 未关注则点 → 回读文案确认
         """
+        # 已在帖子页时，点作者名进入主页
+        #
+        # ⚠️ 不能用 a[href*="/app/user/"] 的第一个匹配：
+        # 实测页面顶部导航里有**当前登录用户自己**的主页链接，
+        # 而且是 DOM 中最靠前的，直接取第一条会点到自己主页
+        # （那里没有关注按钮，于是报「作者主页未出现关注按钮」）。
+        # 因此必须按作者 hash 精确定位。
         if not author_hash:
-            raise StepError("缺少作者 hash，无法执行关注")
+            raise StepError("缺少作者 hash，无法精确定位作者主页链接")
 
-        # 先查当前状态，已关注就不必再进主页
-        user = (self.api.user_detail(author_hash) or {}).get("user") or {}
-        if user.get("followed"):
-            log.info("  已关注作者 %s，跳过", author_uid)
-            return
-
-        # 真实操作：点作者名进入主页
+        selector = f'a[href*="/app/user/{author_hash}"]'
         try:
-            link = self.driver.find(SEL_AUTHOR_LINK, timeout=10)
+            link = self.driver.find(selector, timeout=10)
         except Exception as exc:
-            raise StepError(f"未找到作者主页链接：{exc}") from exc
+            raise StepError(f"未找到作者主页链接（{author_hash}）：{exc}") from exc
 
         self._consume_write()
         kind = self.driver.safe_click(link, "作者名")
         if kind == "failed":
             raise StepError("点击作者名失败")
+        log.info("  已点击作者名")
 
-        # 主页是新标签还是本页跳转，两种都处理
+        # 可能是新标签，也可能本页跳转
         try:
             handles = self.driver.raw.window_handles
             if len(handles) > 1:
@@ -150,30 +159,54 @@ class Participant:
         except Exception as exc:
             log.debug("切换作者主页窗口失败：%s", exc)
 
-        # 主页上找关注按钮并点击
+        # 等关注按钮出现
         follow_sel = ".bt-green-border.follow"
+        if not self.driver.wait_selector(follow_sel, timeout=20):
+            raise StepError("作者主页未出现关注按钮")
+        self._pause(1, 2)
+
         try:
-            btn = self.driver.find(follow_sel, timeout=15)
+            btn = self.driver.find(follow_sel, timeout=10)
         except Exception as exc:
-            raise StepError(f"作者主页未找到关注按钮：{exc}") from exc
+            raise StepError(f"未找到关注按钮：{exc}") from exc
 
-        text = (btn.text or "").strip()
-        log.info("  关注按钮文案：%r", text)
-        if "已关注" not in text:
-            self.driver.safe_click(btn, "关注按钮")
-            log.info("  已点击关注按钮")
-            self._pause(2, 3)
+        text = self._read_follow_text(btn)
+        log.info("  关注按钮当前文案：%r", text)
 
-        # 回读确认
-        for attempt in range(4):
-            user = (self.api.user_detail(author_hash) or {}).get("user") or {}
-            if user.get("followed"):
-                log.info("  关注已确认（第 %d 次回读）", attempt + 1)
+        if "已关注" in text:
+            log.info("  已是关注状态，无需点击")
+            self._close_extra_tabs()
+            return
+
+        self.driver.safe_click(btn, "关注按钮")
+        log.info("  已点击关注按钮")
+
+        # 回读文案确认（页面会异步刷新按钮状态）
+        for attempt in range(6):
+            time.sleep(2)
+            try:
+                btn = self.driver.find(follow_sel, timeout=5)
+                text = self._read_follow_text(btn)
+            except Exception:
+                text = ""
+            if "已关注" in text:
+                log.info("  关注已确认（第 %d 次回读，文案=%r）", attempt + 1, text)
                 self._close_extra_tabs()
                 return
-            time.sleep(2 + attempt)
+            log.debug("  第 %d 次回读文案：%r", attempt + 1, text)
 
-        raise StepError(f"关注 {author_uid} 后回读仍为未关注")
+        raise StepError("点击关注后按钮未变为「已关注」")
+
+    @staticmethod
+    def _read_follow_text(btn) -> str:
+        """读关注按钮文案，兼容 innerText/get_attribute 两种取值。"""
+        try:
+            return (btn.text or "").strip()
+        except Exception:
+            try:
+                return (btn.get_attribute("innerText") or "").strip()
+            except Exception:
+                return ""
 
     def _close_extra_tabs(self) -> None:
         """关掉关注时可能打开的新标签，回到帖子页。"""
@@ -377,8 +410,9 @@ class Participant:
 
             # 1. 关注（已完成则跳过，绝不重复）
             if not done.get("followed_at"):
-                if author_uid:
-                    self.ensure_followed(author_hash, int(author_uid))
+                # 需要 author_hash 精确定位作者链接：页面顶部有当前用户自己的
+                # 主页链接且排在更前面，只按 /app/user/ 前缀取第一条会点到自己
+                self.ensure_followed(author_hash, int(author_uid or 0))
                 self.db.mark_followed(hash_)
                 result.steps.append("follow")
                 # 关注会跳走，回来重新开帖

@@ -95,9 +95,12 @@ class FakeDriver:
 
     # --- 元素 ---
     def find(self, css, timeout=10):
-        if css not in self._elements:
-            raise RuntimeError(f"元素不存在：{css}")
-        return self._elements[css]
+        if css in self._elements:
+            return self._elements[css]
+        # 支持 a[href*="/app/user/XXX"] 这种按作者 hash 精确定位
+        if "app/user/" in css:
+            return self._elements["a[href*=\"/app/user/\"]"]
+        raise RuntimeError(f"元素不存在：{css}")
 
     def find_all(self, css):
         el = self._elements.get(css)
@@ -275,6 +278,8 @@ def build_driver(api):
 
     d._elements = {
         "a[href*=\"/app/user/\"]": FakeElement("作者", displayed=True),
+        'a[href*="/app/user/UH77"]': FakeElement("作者", displayed=True),
+        'a[href*="/app/user/UH90"]': FakeElement("作者", displayed=True),
         ".bt-green-border.follow": FakeElement("关注 TA", on_click=on_follow_click),
         ".target_comment-editor .ql-editor": FakeElement(""),
         "a.plugin-btn.submit": FakeElement("点击抽奖"),
@@ -309,6 +314,10 @@ def main() -> int:
         api2 = FakeApi()
         api2.register("H1", 1001, 77, "UH77")
         p2, d2 = make_bundle(api2, db)
+        # 主页按钮初始为「关注 TA」，点击后变「已关注」
+        d2._elements[".bt-green-border.follow"] = FakeElement(
+            "关注 TA", on_click=lambda: d2._elements[".bt-green-border.follow"].__setattr__("text", "已关注")
+        )
         p2.ensure_followed("UH77", 77)
         check(
             "点过作者名",
@@ -321,25 +330,43 @@ def main() -> int:
             str(d2.actions),
         )
 
-        print("\n[4] 关注：已关注则不做任何点击")
+        print("\n[4] 关注：主页已显示「已关注」则不再点按钮")
         api3 = FakeApi()
         api3.register("H1", 1001, 77, "UH77")
-        api3.followed[77] = 1
         p3, d3 = make_bundle(api3, db)
+        d3._elements[".bt-green-border.follow"] = FakeElement("已关注")
         p3.ensure_followed("UH77", 77)
-        check("未点作者名", not any(a == ("click", "作者名") for a in d3.actions), str(d3.actions))
+        check("仍会进主页（要看状态）", any(a == ("click", "作者名") for a in d3.actions))
+        check(
+            "但不点关注按钮",
+            not any(a == ("click", "关注按钮") for a in d3.actions),
+            str(d3.actions),
+        )
 
-        print("\n[5] 关注未生效 → 判失败")
+        print("\n[5] 点击后按钮不变 → 判失败")
         api4 = FakeApi()
         api4.register("H1", 1001, 77, "UH77")
-        api4.follow_not_effective = True
         p4, d4 = make_bundle(api4, db)
+        # 按钮文案永远不变，模拟点击无效
+        d4._elements[".bt-green-border.follow"] = FakeElement("关注 TA")
         try:
             p4.ensure_followed("UH77", 77)
             ok = False
         except Exception as exc:
-            ok = "关注" in str(exc)
-        check("回读未关注时抛错", ok)
+            ok = "已关注" in str(exc) or "关注" in str(exc)
+        check("按钮未变化时抛错", ok)
+
+        print("\n[5b] 缺作者 hash → 明确报错，不乱点")
+        api5b = FakeApi()
+        api5b.register("H1", 1001, 77, "UH77")
+        p5b, d5b = make_bundle(api5b, db)
+        try:
+            p5b.ensure_followed(None, 77)
+            ok5b = False
+        except Exception as exc:
+            ok5b = "hash" in str(exc)
+        check("缺 hash 时拒绝执行", ok5b)
+        check("且没有乱点", not any(a[0] == "click" for a in d5b.actions), str(d5b.actions))
 
         print("\n[6] 回复：优先点站点快捷按钮")
         api5 = FakeApi()

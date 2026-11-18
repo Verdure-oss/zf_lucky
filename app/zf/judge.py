@@ -120,15 +120,31 @@ class DetailChecker:
 
 
 def extract_flow_meta(info: LotteryInfo) -> Dict[str, Any]:
-    """从判定结果里取出落库所需的 flow 元信息。"""
+    """
+    从判定结果里取出落库所需的 flow 元信息。
+
+    ⚠️ 注意 author_hash 的来源：实测 flow.user 里**没有 hash_id 字段**，
+    只有 view_url（形如 /app/user/AkvjrDA00WbYjX）。若直接取 hash_id
+    会得到 None，导致关注步骤报「缺少作者 hash」而整条失败。
+    因此这里优先取 hash_id，回退到从 view_url 解析。
+    """
     flow = (info.raw or {}).get("flow") or {}
     user = flow.get("user") or {}
+
+    author_hash = user.get("hash_id") or user.get("hashId") or ""
+    if not author_hash:
+        view_url = user.get("view_url") or ""
+        # /app/user/XXXX 或 /user/XXXX
+        parts = [p for p in str(view_url).split("/") if p]
+        if parts and parts[-1] and parts[-1] != "user":
+            author_hash = parts[-1]
+
     return {
         "flow_id": flow.get("id"),
         "title": (flow.get("title") or "").strip(),
         "created_at": flow.get("created_at"),
         "author_uid": user.get("id"),
-        "author_hash": user.get("hash_id"),
+        "author_hash": author_hash or None,
         "author_nick": user.get("nickname"),
     }
 
