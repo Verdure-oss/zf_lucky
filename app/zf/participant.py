@@ -159,14 +159,19 @@ class Participant:
 
     def like_flow(self, flow_id: int) -> None:
         """
-        点赞并回读确认 has_zan==1。
+        点赞并回读确认。
 
         必须先查 has_zan：已点赞的再点会变成取消赞，
         反而把「已参与」标记抹掉。
 
-        ⚠️ 回读要留足时间：详情接口有缓存，点赞成功后立刻查可能仍是 0。
-        实测多条帖子出现「点赞成功但回读为 0」，事后复查 has_zan 已是 1。
-        原实现只等约 7 秒（1.5+2.5+3.5），不够；改为递增等待、总计约 30 秒。
+        ⚠️ 回读**不能只看 flow_detail 的 has_zan**：
+        实测该字段有明显的读缓存，点赞成功后 16 秒甚至 30 秒以上仍是 0，
+        而 zanFlow 早已返回「已赞」。这会导致「点赞成功却判失败」，
+        并让这帖进入重试——下次运行会再点一次，反而变成取消赞，抹掉标记。
+
+        改用 /v2/user/zan/list（我的点赞列表）核对：
+        实测点赞后立刻就能在列表里查到目标帖，无缓存延迟。
+        这是「服务端确实记录了我的赞」的直接证据，比 has_zan 可靠得多。
         """
         info = self.api.flow_detail(self._current_hash)
         flow = info.get("flow") or {}
@@ -174,33 +179,64 @@ class Participant:
             log.info("  已点赞，跳过")
             return
 
+        # 先查点赞列表兜底：可能 has_zan 只是缓存没刷新，其实早就赞过
+        if self._in_watchlist(self._current_hash):
+            log.info("  点赞列表已存在该帖（has_zan 为缓存旧值），跳过")
+            return
+
         self._consume_write()
-        self.api.zan_flow(flow_id)
-        log.info("  已发送点赞请求")
+        result = self.api.zan_flow(flow_id)
+        msg = (result or {}).get("msg") or ""
+        log.info("  已发送点赞请求（%s）", msg or "ok")
 
-        # 递增等待：2, 4, 6, 8, 10 秒，累计约 30 秒
-        for attempt, wait in enumerate((2, 4, 6, 8, 10), start=1):
+        # 主判据：点赞列表
+        for attempt, wait in enumerate((1, 2, 3, 5), start=1):
+            if self._in_watchlist(self._current_hash):
+                log.info("  点赞已确认（列表核对，第 %d 次）", attempt)
+                return
             time.sleep(wait)
-            info = self.api.flow_detail(self._current_hash)
-            flow = info.get("flow") or {}
+
+        # 兜底判据：has_zan（有缓存，可能滞后）
+        for wait in (3, 6):
+            time.sleep(wait)
+            flow = (self.api.flow_detail(self._current_hash).get("flow") or {})
             if int(flow.get("has_zan") or 0) == 1:
-                log.info("  点赞已确认（第 %d 次回读）", attempt)
+                log.info("  点赞已确认（has_zan，滞后刷新）")
                 return
 
-        # 最后再刷新一次页面后复查，排除页面级缓存
-        try:
-            self.api.driver.get(
-                f"https://www.zfrontier.com/app/flow/{self._current_hash}"
+        # zanFlow 明确回了「已赞」也算成功：站点已接受，只是两个读接口都没及时更新
+        if "已赞" in msg:
+            log.warning(
+                "  点赞接口返回「已赞」但列表与 has_zan 均未及时反映，"
+                "按成功处理（避免下次重试反而取消赞）"
             )
-            info = self.api.flow_detail(self._current_hash)
-            flow = info.get("flow") or {}
-            if int(flow.get("has_zan") or 0) == 1:
-                log.info("  点赞已确认（刷新页面后复查）")
-                return
-        except Exception as exc:
-            log.debug("刷新复查失败：%s", exc)
+            return
 
-        raise StepError("点赞后回读 has_zan 仍为 0（已等待约 30 秒）")
+        raise StepError("点赞后无法确认（列表与 has_zan 均未反映）")
+
+    def _in_watchlist(self, hash_: str, pages: int = 2) -> bool:
+        """
+        在「我的点赞列表」里查找指定帖子。
+
+        只看前几页：刚点的赞一定在最前面，没必要翻很多页。
+        """
+        for page in range(1, pages + 1):
+            try:
+                data = self.api.post("/v2/user/zan/list", {"page": page}) or {}
+            except ApiError as exc:
+                log.debug("查询点赞列表失败（page=%d）：%s", page, exc)
+                return False
+            items = data.get("list") or []
+            for item in items:
+                h = item.get("hash_id")
+                if not h:
+                    flow = item.get("flow") or {}
+                    h = flow.get("hash_id")
+                if h == hash_:
+                    return True
+            if not items:
+                break
+        return False
 
     # ---------- 预算 ----------
 
@@ -241,17 +277,32 @@ class Participant:
             return result
 
         try:
-            # 1. 关注
-            self.ensure_followed(int(author_uid), author_hash)
-            self.db.mark_followed(hash_)
-            result.steps.append("follow")
+            # 断点续跑：失败重试时不要重复已经成功的动作。
+            #
+            # 为什么必须这么做：回复是不可撤销的公开动作，重复回复等于刷屏，
+            # 且这条帖子会被作者看到。实测出现过「回复成功、点赞判失败」，
+            # 若不记录已完成步骤，下次重试会再回复一遍。
+            done = self.db.get_participation(hash_) or {}
 
-            # 2. 回复
-            reply_info = self.send_reply(int(flow_id))
-            self.db.mark_replied(hash_, reply_info["reply_id"], reply_info["floor"])
-            result.steps.append("reply")
-            result.reply_id = reply_info["reply_id"]
-            result.floor = reply_info["floor"]
+            # 1. 关注（已关注则跳过，ensure_followed 内部也会再校验一次）
+            if not done.get("followed_at"):
+                self.ensure_followed(int(author_uid), author_hash)
+                self.db.mark_followed(hash_)
+                result.steps.append("follow")
+            else:
+                log.info("  关注已完成过，跳过")
+
+            # 2. 回复（已完成则绝对不能再发）
+            if not done.get("replied_at"):
+                reply_info = self.send_reply(int(flow_id))
+                self.db.mark_replied(hash_, reply_info["reply_id"], reply_info["floor"])
+                result.steps.append("reply")
+                result.reply_id = reply_info["reply_id"]
+                result.floor = reply_info["floor"]
+            else:
+                log.info("  回复已完成过（reply_id=%s），跳过", done.get("reply_id"))
+                result.reply_id = done.get("reply_id")
+                result.floor = done.get("reply_floor")
 
             # 3. 点赞
             self.like_flow(int(flow_id))

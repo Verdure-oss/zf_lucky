@@ -50,6 +50,7 @@ class FakeApi:
         self.has_zan = {}         # hash -> 0/1
         self.replies = {}         # flow_id -> [uid,...]
         self._hash_to_flow = {}   # hash -> flow_id
+        self.zan_list = []        # 我的点赞列表（hash 顺序）
 
         # 故障开关
         self.fail_follow = False
@@ -113,7 +114,19 @@ class FakeApi:
         if not self.like_not_effective:
             for h, fid in self._hash_to_flow.items():
                 if fid == flow_id:
+                    # 真实站点的 has_zan 有读缓存；这里默认同步，
+                    # 需要模拟延迟时把 like_not_effective 打开
                     self.has_zan[h] = 1
+                    self.zan_list.insert(0, h)
+        return {"msg": "已赞 \\(^o^)/"}
+
+    def post(self, path, data=None, **kw):
+        self.calls.append("post:" + path)
+        if path == "/v2/user/zan/list":
+            page = int((data or {}).get("page") or 1)
+            if page == 1:
+                return {"list": [{"hash_id": h} for h in self.zan_list], "pager": {}}
+            return {"list": [], "pager": {}}
         return {}
 
     def unzan_flow(self, flow_id):
@@ -224,15 +237,18 @@ def main() -> int:
         check("原因提到回读", "回读" in (res5.fail_reason or ""), res5.fail_reason or "")
         check("没有继续点赞", "zan_flow" not in api5.calls, str(api5.calls))
 
-        print("\n[7] 点赞未生效 → 判失败")
+        print("\n[7] 点赞接口报「已赞」但两处回读都没反映 → 按成功处理")
+        # 这是有意为之：实测 has_zan 有读缓存（16~30 秒仍为 0），
+        # 若判失败，下次重试会再点一次，反而把赞取消掉。
+        # 因此 zanFlow 明确回了「已赞」就认为站点已接受。
         api6 = FakeApi()
         api6.register("H5", 1005, 81, "UH81")
         api6.like_not_effective = True
         add_flow(db, "H5", 1005, author_uid=81)
         p6 = Participant(api6, db, Corpus(), MY_UID, write_budget=10)
         res6 = p6.participate(db.get_flow("H5"))
-        check("点赞未生效则失败", not res6.success)
-        check("原因提到 has_zan", "has_zan" in (res6.fail_reason or ""), res6.fail_reason or "")
+        check("接口已赞则判成功", res6.success, str(res6.fail_reason or ""))
+        check("状态为 done", db.get_participation("H5")["state"] == STATE_DONE)
 
         print("\n[8] 限流中止且不消耗重试")
         api7 = FakeApi()
@@ -299,6 +315,25 @@ def main() -> int:
         check("缺 flow_id 则失败", not res12.success)
         check("原因说明缺字段", "flow_id" in (res12.fail_reason or ""), res12.fail_reason or "")
 
+
+        print("\n[14] 断点续跑：已完成步骤不重复执行")
+        api14 = FakeApi()
+        api14.register("H12", 1012, 90, "UH90")
+        add_flow(db, "H12", 1012, author_uid=90)
+        # 模拟上次「回复成功、点赞失败」：先标记已关注、已回复
+        db.mark_followed("H12")
+        db.mark_replied("H12", 777, 33)
+        db.bump_retry("H12", "点赞后回读 has_zan 仍为 0")
+        p14 = Participant(api14, db, Corpus(), MY_UID, max_retry=3, write_budget=10)
+        res14 = p14.participate(db.get_flow("H12"))
+        check("重试成功", res14.success, str(res14.fail_reason or ""))
+        check("没有重复关注", "follow" not in api14.calls, str(api14.calls))
+        check("没有重复回复", "reply" not in api14.calls, str(api14.calls))
+        check("只补了点赞", "zan_flow" in api14.calls, str(api14.calls))
+        check("沿用了原 reply_id", res14.reply_id == 777, str(res14.reply_id))
+        row14 = db.get_participation("H12")
+        check("保留原回复时间", bool(row14["replied_at"]))
+        check("状态 done", row14["state"] == STATE_DONE)
         db.close()
 
     print("\n" + "=" * 52)
