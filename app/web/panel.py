@@ -38,6 +38,9 @@ app = Flask(__name__)
 _db: Optional[Database] = None
 _cfg = None
 _login: Optional[LoginSession] = None
+# 登录态探测结果缓存（避免每次刷新面板都拉起浏览器）
+_session_cache: Optional[Dict[str, Any]] = None
+_session_cache_at: float = 0.0
 
 
 def init(db_path: str, cfg=None) -> None:
@@ -58,6 +61,70 @@ def get_login_session() -> LoginSession:
 
 
 # ---------------- VNC 网关 ----------------
+
+def check_session_live(cfg) -> Dict[str, Any]:
+    """
+    真实探测登录态是否可用。
+
+    这是「就绪」的唯一可信判据。
+    只看 .env 里有没有配 Cookie 是不够的——Cookie 可能早已过期，
+    那样面板会显示「就绪」，用户以为一切正常，实际每轮都跑不起来。
+    （这正是最初发生过的问题：配了 Cookie 就显示就绪，但实际无效。）
+
+    代价：每次调用会开一个浏览器会话，约 10~20 秒。
+    因此结果做短期缓存（默认 60 秒），避免面板刷新时反复拉起浏览器。
+    """
+    global _session_cache, _session_cache_at
+    import time
+
+    now = time.time()
+    ttl = 60
+    if _session_cache is not None and (now - _session_cache_at) < ttl:
+        return _session_cache
+
+    if not getattr(cfg, "cookie", ""):
+        result = {"checked": True, "live": False, "reason": "未配置 Cookie"}
+        _session_cache, _session_cache_at = result, now
+        return result
+
+    driver = None
+    try:
+        from ..zf.driver import Driver
+        from ..zf.session import Session, SessionError
+
+        driver = Driver(cfg.selenium_url)
+        driver.start()
+        sess = Session(driver, cfg.cookie)
+        user = sess.establish()
+        rules = sess.check_publish_rule() or {}
+        identity_pass = rules.get("identity_pass")
+
+        live = bool(user) and not user.get("degraded")
+        result = {
+            "checked": True,
+            "live": live,
+            "uid": user.get("userId"),
+            "nickname": user.get("nickname") or "",
+            "identity_pass": identity_pass,
+            "reason": "" if live else "会话有效但未取到用户身份",
+        }
+        if live and identity_pass == 0:
+            result["live"] = False
+            result["reason"] = "账号未绑定手机号，站点会拒绝回复"
+    except SessionError as exc:
+        result = {"checked": True, "live": False, "reason": str(exc)}
+    except Exception as exc:
+        result = {"checked": True, "live": False, "reason": f"探测失败：{exc}"}
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    _session_cache, _session_cache_at = result, now
+    return result
+
 
 def vnc_status() -> Dict[str, Any]:
     """
@@ -237,6 +304,8 @@ def build_view() -> Dict[str, Any]:
         "cookie_desc": envfile.mask(getattr(_cfg, "cookie", "") or "") if _cfg else "",
         "vnc": vnc_status(),
         "login": _login_safe_status(),
+        "session": check_session_live(_cfg) if _cfg else {"checked": False, "live": False,
+                                                          "reason": "未初始化"},
     }
 
 
@@ -300,6 +369,18 @@ def api_pause():
 
 
 # ---------------- VNC 与登录 ----------------
+
+@app.route("/api/check", methods=["POST"])
+def api_check():
+    """强制重新探测登录态（绕过 60 秒缓存）。"""
+    global _session_cache, _session_cache_at
+    import time as _t
+    _session_cache, _session_cache_at = None, 0.0
+    try:
+        return jsonify(check_session_live(_cfg))
+    except Exception as exc:
+        return jsonify({"checked": True, "live": False, "reason": str(exc)}), 500
+
 
 @app.route("/api/vnc", methods=["GET", "POST"])
 def api_vnc():
@@ -539,7 +620,19 @@ PAGE = r"""
   <div class="sub">
     扫描情报专栏 → 识别抽奖帖 → 关注 + 回复 + 点赞。
     当前时间 {{ v.now }} ｜ 定时 {{ v.run_at }}
+    {% if v.session.live %}
+      ｜ 已登录 <b>{{ v.session.nickname }}</b>（uid {{ v.session.uid }}）
+    {% endif %}
   </div>
+
+  {% if v.session.checked and not v.session.live %}
+  <div class="alerts" style="margin-top:12px">
+    <div class="alert err">
+      登录不可用：{{ v.session.reason }}
+      <br>请点下方「登录并获取 Cookie」重新登录，完成后重启容器生效。
+    </div>
+  </div>
+  {% endif %}
 
   <div class="bar">
     <div class="stat"><b>{{ v.counts['done'] }}</b><span>已完成</span></div>
@@ -549,16 +642,18 @@ PAGE = r"""
     <div class="stat"><b>{{ v.counts['none'] }}</b><span>未参与</span></div>
     <div class="grow"></div>
 
-    <div class="stat">
+    <div class="stat" style="min-width:96px">
       <b style="font-size:12px">
         {% if v.paused %}<span style="color:var(--warn)">已暂停</span>
         {% elif not v.cookie_ok %}<span style="color:var(--err)">未配置 Cookie</span>
-        {% else %}<span style="color:var(--ok)">就绪</span>{% endif %}
+        {% elif v.session.live %}<span style="color:var(--ok)">已登录</span>
+        {% elif v.session.checked %}<span style="color:var(--err)">登录失效</span>
+        {% else %}<span style="color:var(--muted)">未检测</span>{% endif %}
       </b>
       <span>运行状态</span>
     </div>
 
-    <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok %}disabled{% endif %}>立即运行</button>
+    <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>立即运行</button>
     <button onclick="togglePause()">{% if v.paused %}恢复{% else %}暂停{% endif %}</button>
   </div>
 
