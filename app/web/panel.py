@@ -823,8 +823,7 @@ PAGE = r"""
     {% if v.session.live %}
       ｜ 已登录 <b>{{ v.session.nickname }}</b>（uid {{ v.session.uid }}）
     {% endif %}
-    ｜ <a href="{{ v.vnc_path }}" target="_blank" rel="noopener"
-          style="color:var(--accent)">观看浏览器 ↗</a>
+    ｜ <a href="#" onclick="openVnc(event)" style="color:var(--accent)">观看浏览器 ↗</a>
     ｜ <a href="/logs" target="_blank" rel="noopener"
           style="color:var(--accent)">实时日志 ↗</a>
   </div>
@@ -860,7 +859,7 @@ PAGE = r"""
       <span>运行状态</span>
     </div>
 
-    <a href="{{ v.vnc_path }}" target="_blank" rel="noopener" style="text-decoration:none"><button>观看浏览器</button></a>
+    <button onclick="openVnc(event)">观看浏览器</button>
     <a href="/logs" target="_blank" rel="noopener" style="text-decoration:none"><button>日志</button></a>
     <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>立即运行</button>
     <button onclick="togglePause()">{% if v.paused %}恢复{% else %}暂停{% endif %}</button>
@@ -898,8 +897,7 @@ PAGE = r"""
     </div>
     <div class="grow"></div>
     {% if v['login'].running %}
-      <a href="{{ v.vnc_path }}" target="_blank" rel="noopener"
-         style="text-decoration:none"><button class="primary">打开浏览器画面</button></a>
+      <button class="primary" onclick="openVnc(event)">打开浏览器画面</button>
       <button onclick="loginFinish()">我登录好了</button>
       <button onclick="loginCancel()">取消</button>
     {% else %}
@@ -1136,6 +1134,52 @@ function togglePause(){
     setTimeout(function(){ location.reload(); }, 700);
   }).catch(function(e){ toast('请求失败：' + e); });
 }
+/* ---------------- 观看浏览器 ---------------- */
+
+/*
+ * 统一点击入口：网关关着就自动拉起，然后跳转 noVNC。
+ *
+ * 两个关键处理：
+ *  1. 先 window.open 再发请求。浏览器只允许「用户手势」期间开窗，
+ *     若先 await/fetch 再开窗，会被判定为弹窗而拦截。
+ *  2. 网关开启是幂等的（已在跑则直接返回 running），
+ *     因此重复点击也安全。
+ *
+ * 页面若因网关未就绪返回 502，会自动重试几次再放弃。
+ */
+function openVnc(ev){
+  if (ev) { ev.preventDefault(); }
+  var path = {{ v.vnc_path | tojson }};
+
+  // 立即占位开窗（必须在用户手势内），先显示提示页
+  var w = window.open('', '_blank');
+  if (w) {
+    try {
+      w.document.write(
+        '<title>正在打开浏览器画面…</title>' +
+        '<body style="margin:0;background:#0f1115;color:#e6e9ef;' +
+        'font:14px/1.6 -apple-system,sans-serif;display:flex;align-items:center;' +
+        'justify-content:center;height:100vh">' +
+        '<div style="text-align:center">' +
+        '<div style="font-size:16px;margin-bottom:8px">正在连接浏览器…</div>' +
+        '<div style="color:#8b93a1;font-size:12px">若长时间无响应，请回到面板重试</div>' +
+        '</div></body>');
+    } catch (e) {}
+  }
+
+  post('/api/vnc', {enable: true}).then(function(d){
+    if (!d.ok) { toast('开启失败：' + (d.msg || '')); if (w) w.close(); return; }
+    // 网关就绪后跳转，留一点时间给端口监听
+    setTimeout(function(){
+      if (w && !w.closed) { w.location.href = path; }
+      else { window.location.href = path; }
+    }, 1200);
+  }).catch(function(e){
+    toast('请求失败：' + e);
+    if (w) { try { w.close(); } catch (x) {} }
+  });
+}
+
 function doReset(h){
   if (!confirm('重置 ' + h + ' 并重新处理？\n（用于你手动点过赞、程序因此跳过的情况）')) return;
   post('/api/reset/' + h, {}).then(function(d){
@@ -1252,7 +1296,7 @@ LOGS_PAGE = r"""
   <header>
     <h1>执行日志</h1>
     <a href="/">← 返回面板</a>
-    <a href="{{ v.vnc_path }}" target="_blank" rel="noopener">浏览器画面 ↗</a>
+    <a href="#" onclick="openVnc(event)" style="color:var(--accent)">浏览器画面 ↗</a>
     <span class="meta" id="meta"></span>
   </header>
 
@@ -1339,6 +1383,33 @@ function load(){
 function debounceLoad(){
   clearTimeout(tId);
   tId = setTimeout(load, 350);
+}
+
+/* 观看浏览器：网关关着就先自动拉起再跳转 */
+function openVnc(ev){
+  if (ev) { ev.preventDefault(); }
+  var path = {{ v.vnc_path | tojson }};
+  var w = window.open('', '_blank');
+  if (w) {
+    try {
+      w.document.write('<title>正在连接…</title><body style="margin:0;background:#0f1115;' +
+        'color:#e6e9ef;font:14px sans-serif;display:flex;align-items:center;' +
+        'justify-content:center;height:100vh">正在连接浏览器…</body>');
+    } catch (e) {}
+  }
+  fetch('/api/vnc', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enable: true})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    setTimeout(function(){
+      if (w && !w.closed) { w.location.href = path; }
+      else { window.location.href = path; }
+    }, 1200);
+  }).catch(function(){
+    if (w) { try { w.close(); } catch (x) {} }
+    alert('无法开启浏览器观看，请回面板重试');
+  });
 }
 
 function toggleAuto(){
