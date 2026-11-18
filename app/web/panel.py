@@ -36,6 +36,8 @@ WATCH_FLAG_FILE = "/tmp/zf_watch_vnc"
 VNC_GATE_SCRIPT = "/app/scripts/vnc_gate.py"
 ENV_PATH = "/app/.env"
 LOG_DIR = "/app/logs"
+# noVNC 直达路径（与 nginx 中 location 保持一致）
+VNC_PATH = "/vnc-x7k2m9/vnc.html?autoconnect=1&resize=scale"
 
 app = Flask(__name__)
 _db: Optional[Database] = None
@@ -225,7 +227,9 @@ def build_view() -> Dict[str, Any]:
 
     # 上次运行
     last = db.last_run() or {}
-    last_running = last.get("result") == "running"
+    # 数据库里的 running 只代表「启动时写入了记录」，进程可能已被杀。
+    # 用锁文件是否被持有来交叉验证，避免面板长期误显示「运行中」。
+    last_running = last.get("result") == "running" and _runner_alive()
 
     # 帖子列表
     rows = db.list_for_panel(limit=300)
@@ -307,9 +311,31 @@ def build_view() -> Dict[str, Any]:
         "cookie_desc": envfile.mask(getattr(_cfg, "cookie", "") or "") if _cfg else "",
         "vnc": vnc_status(),
         "login": _login_safe_status(),
+        "vnc_path": VNC_PATH,
         "session": check_session_live(_cfg) if _cfg else {"checked": False, "live": False,
                                                           "reason": "未初始化"},
     }
+
+
+def _runner_alive() -> bool:
+    """
+    判断主流程是否真的在跑。
+
+    判据是单实例锁文件里的 pid 是否存活——
+    run_logs 里的 result='running' 只说明「开始过」，进程被杀死后不会更新。
+    """
+    try:
+        with open("/tmp/zf_lucky.lock") as fh:
+            pid = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _login_safe_status() -> Dict[str, Any]:
@@ -694,6 +720,10 @@ PAGE = r"""
     {% if v.session.live %}
       ｜ 已登录 <b>{{ v.session.nickname }}</b>（uid {{ v.session.uid }}）
     {% endif %}
+    ｜ <a href="{{ v.vnc_path }}" target="_blank" rel="noopener"
+          style="color:var(--accent)">观看浏览器 ↗</a>
+    ｜ <a href="/logs" target="_blank" rel="noopener"
+          style="color:var(--accent)">实时日志 ↗</a>
   </div>
 
   {% if v.session.checked and not v.session.live %}
@@ -724,9 +754,9 @@ PAGE = r"""
       <span>运行状态</span>
     </div>
 
-    <button class="primary" onclick="doRun(true)" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>运行并观看</button>
-    <button onclick="doRun(false)" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>静默运行</button>
+    <a href="{{ v.vnc_path }}" target="_blank" rel="noopener" style="text-decoration:none"><button>观看浏览器</button></a>
     <a href="/logs" target="_blank" rel="noopener" style="text-decoration:none"><button>日志</button></a>
+    <button class="primary" onclick="doRun()" {% if v.paused or not v.cookie_ok or (v.session.checked and not v.session.live) %}disabled{% endif %}>立即运行</button>
     <button onclick="togglePause()">{% if v.paused %}恢复{% else %}暂停{% endif %}</button>
   </div>
 
@@ -762,15 +792,12 @@ PAGE = r"""
     </div>
     <div class="grow"></div>
     {% if v['login'].running %}
-      <a href="/vnc/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noopener"
+      <a href="{{ v.vnc_path }}" target="_blank" rel="noopener"
          style="text-decoration:none"><button class="primary">打开浏览器画面</button></a>
       <button onclick="loginFinish()">我登录好了</button>
       <button onclick="loginCancel()">取消</button>
     {% else %}
       <button onclick="loginStart()">登录并获取 Cookie</button>
-      {% if v['vnc'].running %}
-      <button onclick="vncToggle(false)">关闭观看</button>
-      {% endif %}
     {% endif %}
   </div>
 
@@ -875,15 +902,9 @@ function post(url, body){
     body: JSON.stringify(body || {})
   }).then(function(r){ return r.json(); });
 }
-function doRun(watch){
-  post('/api/run', {watch_vnc: !!watch}).then(function(d){
+function doRun(){
+  post('/api/run', {}).then(function(d){
     toast(d.msg || (d.ok ? '已提交' : '失败'));
-    if (d.ok && watch){
-      // 顺带打开浏览器画面，方便同时观察
-      setTimeout(function(){
-        window.open('/vnc/vnc.html?autoconnect=1&resize=scale', '_blank');
-      }, 3000);
-    }
     if (d.ok) setTimeout(function(){ location.reload(); }, 1800);
   }).catch(function(e){ toast('请求失败：' + e); });
 }
@@ -913,10 +934,7 @@ function loginStart(){
   toast('正在启动浏览器…');
   post('/api/login/start', {}).then(function(d){
     toast(d.msg || (d.ok ? '已启动' : '失败'));
-    if (d.ok) setTimeout(function(){
-      window.open('/vnc/vnc.html?autoconnect=1&resize=scale', '_blank');
-      location.reload();
-    }, 3500);
+    if (d.ok) setTimeout(function(){ location.reload(); }, 2500);
   }).catch(function(e){ toast('请求失败：' + e); });
 }
 
@@ -1013,9 +1031,7 @@ LOGS_PAGE = r"""
   <header>
     <h1>执行日志</h1>
     <a href="/">← 返回面板</a>
-    {% if v['vnc'].running %}
-    <a href="/vnc/vnc.html?autoconnect=1&resize=scale" target="_blank" rel="noopener">浏览器画面 ↗</a>
-    {% endif %}
+    <a href="{{ v.vnc_path }}" target="_blank" rel="noopener">浏览器画面 ↗</a>
     <span class="meta" id="meta"></span>
   </header>
 

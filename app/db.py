@@ -445,7 +445,23 @@ class Database:
     # ---------- run_logs ----------
 
     def start_run(self) -> int:
+        """
+        开始新一轮。
+
+        先把上次遗留的 running 记录标记为中断——进程若在运行中被重启
+        （容器重建、OOM、手动 kill），那条记录会永远停在 running，
+        面板就会一直显示「运行中」，误导判断。
+        """
         with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE run_logs
+                SET finished_at = ?, result = 'aborted',
+                    note = COALESCE(note, '') || ' [进程在运行中被中断]'
+                WHERE result = 'running'
+                """,
+                (now_str(),),
+            )
             cur.execute(
                 "INSERT INTO run_logs (started_at, result) VALUES (?, 'running')",
                 (now_str(),),
