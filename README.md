@@ -90,14 +90,43 @@ location ^~ / {
 
 | 功能 | 说明 |
 |---|---|
-| 状态总览 | 已完成 / 待执行 / 失败 / 已放弃 / 未参与 |
+| 状态总览 | 中奖 / 未中奖 / 待开奖 / 已完成 / 待执行 / 失败 |
+| 历史战绩 | 累计参与、中奖率、按天趋势图、中奖明细（可折叠） |
+| 结果分区 | 按 待开奖 / 中奖 / 未中奖 / 失败 筛选，支持关键字搜索 |
 | 帖子列表 | 标题、作者、开奖时间、奖品、状态、关注/回复/点赞时间 |
+| 观看浏览器 | 常驻 noVNC 链接，点开即可实时看自动化操作 |
+| 实时日志 | 独立日志页，支持级别过滤、关键字搜索、自动刷新 |
+| 登录并获取 Cookie | 在浏览器里人工登录，程序自动导出写入 .env |
 | 立即运行 | 写触发文件，由主循环串行执行 |
 | 暂停 / 恢复 | 暂停期间定时与手动触发都不会执行 |
 | 单帖重跑 | 清空该帖进度重新处理 |
 | 异常告警 | 验证码待处理、登录失效、限流、异常中止 |
 
 面板本身**不对站点发起任何操作**，唯一写动作是创建触发文件。
+
+### 关于开奖结果
+
+每轮运行末尾会自动检测已参与帖子的开奖情况：
+
+- `lottery.status = 2` 表示已开奖
+- `prizesGroup[].list[].rewardUser.id` 是中奖者的数字 uid
+- 用 **uid 而非昵称**比对（昵称可改、可重名）
+- 中奖率只对已开奖的记录计算，待开奖不计入分母
+
+### 定时安排
+
+本程序默认 **08:00** 运行。若与同一 Selenium 容器上的其他任务共用，
+建议错开时间，例如：
+
+| 时间 | 任务 |
+|---|---|
+| 08:00 | zf_lucky |
+| 09:30 | 其他任务 |
+| 15:42 / 15:45 | 其他任务 |
+
+多个会话会共享同一个 X display，同时运行会导致 noVNC 里窗口重叠。
+本程序会在窗口顶部注入一条 `ZF · zf_lucky` 标识条便于辨认。
+
 
 ## 前置条件
 
@@ -124,17 +153,37 @@ curl -X POST localhost:9997/api/pause \
 每个功能都有可执行自检，改完代码应全绿：
 
 ```bash
-# 离线（无需 selenium）
-python3 scripts/selftest_p01.py   # 配置 + 数据库
-python3 scripts/selftest_p03.py   # 扫描停止条件
-python3 scripts/selftest_p04.py   # 抽奖判定
-python3 scripts/selftest_p05.py   # 参与器（全用假 API）
-python3 scripts/selftest_p06.py   # 调度与编排
-python3 scripts/selftest_p1.py    # 面板
+# 离线（无需 selenium，宿主机即可跑）
+python3 scripts/selftest_p01.py     # 配置 + 数据库 + 跨线程
+python3 scripts/selftest_p05.py     # 参与器（全用假 driver/API）
+python3 scripts/selftest_p06.py     # 调度 + 编排 + 锁
+python3 scripts/selftest_corpus.py  # 评论生成与相关性
+python3 scripts/selftest_draw.py    # 开奖结果判定
+python3 scripts/selftest_seen.py    # 扫描停止条件
+python3 scripts/selftest_p03.py     # 扫描器（部分需 selenium）
+python3 scripts/selftest_p04.py     # 抽奖判定（部分需 selenium）
+python3 scripts/selftest_p1.py      # 面板（需 flask）
+python3 scripts/selftest_p2.py      # VNC/登录/.env 写入（需 flask）
 
-# 需在 bili-net 网络内（连真实 Selenium）
+# 需在 bili-net 网络内（连真实 Selenium 与站点）
 docker exec zf-lucky python scripts/selftest_p02.py
 ```
+
+### 演示脚本（人工目视检查）
+
+在真实浏览器里完整走一遍 关注 → 回复 → 点赞，用于确认动作是否正确：
+
+```bash
+# 建议用非抽奖帖，避免污染抽奖记录
+docker exec zf-lucky python /app/scripts/demo_run.py <flow_hash> --slow 3
+
+# 可选开关
+--no-follow / --no-reply / --no-like   只做部分步骤
+--slow N                              停顿放大 N 倍，便于观察
+```
+
+运行前先在面板点「观看浏览器」打开 noVNC，即可实时看到操作过程。
+
 
 
 ## 底线
